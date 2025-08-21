@@ -3,7 +3,7 @@
 __all__ = ['Problem']
 
 # Internal Cell
-from .plotting import plot_scalar_field, pyvista_plot_scalar_field, plot_vector_field
+# from .plotting import plot_scalar_field, pyvista_plot_scalar_field, plot_vector_field
 
 # Internal Cell
 class PlottingForProblem:
@@ -21,69 +21,70 @@ class PlottingForProblem:
         show_ticklabels=False,
         export_png=False,
     ):
-        file_path_ = file_path
+        pass
+        #file_path_ = file_path
 
-        if use_pyvista:
-            pyvista_plotting_kwargs = {'problem': problem,
-                               'display': display,
-                               'camera_position': camera_position,
-                               'window_size': window_size,
-                               'smooth_iters': smooth_iters}
+        # if use_pyvista:
+        #     pyvista_plotting_kwargs = {'problem': problem,
+        #                        'display': display,
+        #                        'camera_position': camera_position,
+        #                        'window_size': window_size,
+        #                        'smooth_iters': smooth_iters}
 
-        plotting_kwargs = {'problem': problem,
-                           'display': display,
-                           'camera_position': camera_position,
-                           'show_colorbar': show_colorbar,
-                           'show_axislabels': show_axislabels,
-                           'show_ticklabels':show_ticklabels,
-                           'export_png':export_png}
+        # plotting_kwargs = {'problem': problem,
+        #                    'display': display,
+        #                    'camera_position': camera_position,
+        #                    'show_colorbar': show_colorbar,
+        #                    'show_axislabels': show_axislabels,
+        #                    'show_ticklabels':show_ticklabels,
+        #                    'export_png':export_png}
 
-        scalar_field_plotting_dict ={
-            'scalar_field': [problem.Ω_dirichlet.sum(dim=0).cpu().detach().numpy(),
-                             (problem.Ω_design.squeeze() != 0).cpu().detach().numpy(),
-                             (problem.F.norm(dim=0) != 0).cpu().detach().numpy()],
-            'data': [problem.Ω_dirichlet.sum(dim=0).cpu().detach().numpy(),
-                     problem.Ω_design.squeeze().cpu().detach().numpy(),
-                     (problem.F.norm(dim=0) != 0).cpu().detach().numpy()],
-            'title': ['Locations of homogeneous Dirichlet boundary conditions',
-                      'Design space information',
-                      'Force locations'],
-            'file_path_suffix': ['dirichlet',
-                                 'design_space',
-                                 'force_locations']
-        }
+        # scalar_field_plotting_dict ={
+        #     'scalar_field': [problem.Ω_dirichlet.sum(dim=0).cpu().detach().numpy(),
+        #                      (problem.Ω_design.squeeze() != 0).cpu().detach().numpy(),
+        #                      (problem.F.norm(dim=0) != 0).cpu().detach().numpy()],
+        #     'data': [problem.Ω_dirichlet.sum(dim=0).cpu().detach().numpy(),
+        #              problem.Ω_design.squeeze().cpu().detach().numpy(),
+        #              (problem.F.norm(dim=0) != 0).cpu().detach().numpy()],
+        #     'title': ['Locations of homogeneous Dirichlet boundary conditions',
+        #               'Design space information',
+        #               'Force locations'],
+        #     'file_path_suffix': ['dirichlet',
+        #                          'design_space',
+        #                          'force_locations']
+        # }
 
 
-        for i in range(3):
-            if use_pyvista:
-                pyvista_plot_scalar_field(
-                    scalar_field=scalar_field_plotting_dict['scalar_field'][i],
-                    data=scalar_field_plotting_dict['data'][i],
-                    threshold=0.,
-                    title=scalar_field_plotting_dict['title'][i],
-                    **pyvista_plotting_kwargs
-                )
-            else:
-                if file_path != None:
-                    file_path_ = f"{file_path}_{scalar_field_plotting_dict['file_path_suffix'][i]}"
-                plot_scalar_field(
-                    scalar_field=scalar_field_plotting_dict['scalar_field'][i],
-                    data=scalar_field_plotting_dict['data'][i],
-                    threshold=0.,
-                    title=scalar_field_plotting_dict['title'][i],
-                    file_path=file_path_,
-                    **plotting_kwargs
-                )
+        # for i in range(3):
+        #     if use_pyvista:
+        #         # pyvista_plot_scalar_field(
+        #         #     scalar_field=scalar_field_plotting_dict['scalar_field'][i],
+        #         #     data=scalar_field_plotting_dict['data'][i],
+        #         #     threshold=0.,
+        #         #     title=scalar_field_plotting_dict['title'][i],
+        #         #     **pyvista_plotting_kwargs
+        #         # )
+        #     else:
+        #         if file_path != None:
+        #             file_path_ = f"{file_path}_{scalar_field_plotting_dict['file_path_suffix'][i]}"
+        #         plot_scalar_field(
+        #             scalar_field=scalar_field_plotting_dict['scalar_field'][i],
+        #             data=scalar_field_plotting_dict['data'][i],
+        #             threshold=0.,
+        #             title=scalar_field_plotting_dict['title'][i],
+        #             file_path=file_path_,
+        #             **plotting_kwargs
+        #         )
 
-        if file_path != None:
-            file_path_ = f"{file_path}_force_directions"
+        # if file_path != None:
+        #     file_path_ = f"{file_path}_force_directions"
 
-        plot_vector_field(
-            vector_field=problem.F,
-            title="Force directions",
-            file_path=file_path_,
-            **plotting_kwargs
-        )
+        # plot_vector_field(
+        #     vector_field=problem.F,
+        #     title="Force directions",
+        #     file_path=file_path_,
+        #     **plotting_kwargs
+        # )
 
 # Internal Cell
 import torch
