@@ -88,7 +88,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from collections import defaultdict
 
-from .plotting import plot_curve
 from .utils import create_dir, save_dict_as_txt, cast_to_solutions
 
 # Internal Cell

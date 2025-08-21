@@ -292,32 +292,3 @@ class Problem:
         Returns a deepcopy of the Problem object.
         """
         return copy.deepcopy(self)
-
-
-    def plot(self,
-             display:bool=True, # Whether the figure is displayed.
-             file_path:str=None, # Path where the figure is saved.
-             camera_position:Union[list,tuple]=(0,.1,.12), # x, y, and z coordinates of the camera position.
-             use_pyvista:bool=False, # Whether to use pyvista for plotting. If `False`, then plotly is used. Pyvista generates better looking visualizations, but does not support basic features like colorbars, title display and saving.
-             window_size:Union[tuple,list]=(800,800), # The size of the window that displays the plot. Only has an effect if `use_pyvista=True`.
-             smooth_iters:int=0, # The number of smoothing iterations for better looking visualizations. Only has an effect if `use_pyvista=True`.
-             show_colorbar:bool=True, # Determines whether a reference colorbar is displayed for the plotted voxel color values.
-             show_axislabels:bool=False, # Whether the 3d axes are labelled with their dimensions.
-             show_ticklabels:bool=False, # Whether the 3d axes ticks are displayed and labeled.
-             export_png:bool=False): # Whether the figure is exported and saved as a png file, in addition to the standard html format.
-        """
-        Renders 3D figures that display the location of Dirichlet boundaries, design space and forces.
-        """
-        PlottingForProblem()(
-            self,
-            display=display,
-            file_path=file_path,
-            camera_position=camera_position,
-            use_pyvista=use_pyvista,
-            window_size=window_size,
-            smooth_iters=smooth_iters,
-            show_colorbar=show_colorbar,
-            show_axislabels=show_axislabels,
-            show_ticklabels=show_ticklabels,
-            export_png=export_png,
-        )

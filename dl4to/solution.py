@@ -5,8 +5,6 @@ __all__ = ['Solution']
 # Internal Cell
 import numpy as np
 
-from .plotting import plot_scalar_field, pyvista_plot_scalar_field
-
 # Internal Cell
 def add_corners(solution):
     solution._θ[:,0,0,0] = 1.
@@ -249,47 +247,6 @@ class Solution:
         Detaches θ from its computational graph. This is an in-place version of the `detach()` method.
         """
         self._θ.detach_()
-
-
-    def plot(
-        self,
-        binary:bool=False, # Whether the density should be binarized before plotting and before solving the PDE. Note that the PDE is solved only if `solve_pde=True` and problem has a PDE solver attached to it.
-        solve_pde:bool=False, # Whether to solve the PDE of linear elasticity and plot the absolute displacements and von Mises stresses.
-        normalize_σ_vm:bool=True, # Whether the von Mises stresses should be normalized with the yield stress.
-        threshold:float=0., # Density threshold below which voxels should be displayed as empty.
-        display:bool=True, # Whether the figure is displayed.
-        file_path:str=None, # Path where the figure is saved.
-        camera_position:tuple=(0,.1,.12), # x, y, and z coordinates of the camera position.
-        show_design_space:bool=False, # Whether to highlight the voxels that have a design space information of -1 assigned to them.
-        use_pyvista:bool=False, # Whether to use pyvista for plotting. If `False`, then plotly is used. Pyvista generates better looking visualizations, but does not support basic features like colorbars, title display and saving.
-        window_size:Union[tuple,list]=(800,800), # The size of the window that displays the plot. Only has an effect if `use_pyvista=True`.
-        smooth_iters:int=0, # The number of smoothing iterations for better looking visualizations. Only has an effect if `use_pyvista=True`.
-        show_colorbar:bool=True, # Determines whether a reference colorbar is displayed for the plotted voxel color values.
-        show_axislabels:bool=False, # Whether the 3d axes are labelled with their dimensions.
-        show_ticklabels:bool=False, # Whether the 3d axes ticks are displayed and labeled.
-        export_png:bool=False # Whether the figure is exported and saved as a png file, in addition to the standard html format.
-    ):
-        """
-        Renders a 3D figure that displays the density distribution and, optionally, additional ones that display the displacements and von Mises stresses for that density.
-        """
-        PlottingForSolution()(
-            solution=self,
-            binary=binary,
-            solve_pde=solve_pde,
-            normalize_σ_vm=normalize_σ_vm,
-            threshold=threshold,
-            display=display,
-            file_path=file_path,
-            camera_position=camera_position,
-            show_design_space=show_design_space,
-            use_pyvista=use_pyvista,
-            window_size=window_size,
-            smooth_iters=smooth_iters,
-            show_colorbar=show_colorbar,
-            show_axislabels=show_axislabels,
-            show_ticklabels=show_ticklabels,
-            export_png=export_png
-        )
 
 
     def solve_pde(self,
