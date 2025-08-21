@@ -293,3 +293,6 @@ class Problem:
         Returns a deepcopy of the Problem object.
         """
         return copy.deepcopy(self)
+    
+    def plot(self, **kwargs):
+        print("WARNING: Plotting is removed from library")
