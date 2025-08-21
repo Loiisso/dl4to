@@ -138,6 +138,8 @@ class Solution:
         self.θ = θ
         self._check_θ_shape_and_range()
 
+    def plot(self, **kwargs):
+        print("WARNING: Plotting is removed from library")
 
     @property
     def θ(self):
