@@ -13,8 +13,12 @@ from scipy.sparse.linalg import factorized, use_solver, spsolve
 from scipy.sparse import csc_matrix
 from typing import Callable
 
-use_solver(assumeSortedIndices=True)
-
+try:
+    use_solver(useUmfpack=True, assumeSortedIndices=True)
+except Exception as e:
+    warnings.warn(f"Not using UMFPACK: {e}")
+    use_solver(useUmfpack=False, assumeSortedIndices=True)
+    
 # Cell
 class AutogradLinearSolver(torch.autograd.Function):
     @staticmethod
