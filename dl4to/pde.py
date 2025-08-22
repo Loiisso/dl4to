@@ -18,6 +18,18 @@ try:
 except Exception as e:
     warnings.warn(f"Not using UMFPACK: {e}")
     use_solver(useUmfpack=False, assumeSortedIndices=True)
+
+# Internal Cell
+
+from .utils import get_σ_vm
+from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly, UnpaddedFDM
+try:
+    import cupy as cp
+    from cupyx.scipy.sparse import csc_matrix as cp_csc_matrix
+    from cupyx.scipy.sparse.linalg import spsolve as cp_spsolve
+except ImportError:
+    print("cupy is imported/used only if availabe ")
+    cp = None
     
 # Cell
 class AutogradLinearSolver(torch.autograd.Function):
@@ -110,21 +122,55 @@ class LinearSolver():
 # Cell
 class SparseLinearSolver(LinearSolver):
     """
-    A sparse linear solver implementation based on the `scipy.sparse.linalg.solve()` method that is used to solve the PDE of linear elasticity.
+    A sparse linear solver that uses scipy (CPU) and optionally cupy (GPU) if available.
     """
     def __init__(self,
-                 use_umfpack:bool=True, # Whether to use umfpack. If false, then the LU solver from `scipy.sparse` is used, which is usually slower.
-                 factorize:bool=False # Whether the system matrix should be factorized.
+                 use_umfpack:bool=True,      # Whether to use umfpack on CPU.
+                 factorize:bool=False,       # Whether to factorize (CPU only).
+                 use_cupy:bool=True          # Try to use cupy when CUDA + cupy available.
                 ):
-        if use_umfpack or factorize:
-            if importlib.util.find_spec('scikits') is None:
-                warnings.warn("The package scikits.umfpack is not installed.Therefore, the LU solver from scipy.sparse is used, which is usually slower.")
-
         self.use_umfpack = use_umfpack
+        self.use_cupy_requested = use_cupy
+        self.have_cupy = False
+        self.backend = "scipy"
+
+        # Check cupy availability
+        if use_cupy:
+            try:
+                import cupy  # noqa: F401
+                if torch.cuda.is_available():
+                    self.have_cupy = True
+                    self.backend = "cupy"
+                else:
+                    warnings.warn("CUDA not available; falling back to scipy backend.")
+            except ImportError:
+                warnings.warn("cupy not installed; falling back to scipy backend.")
+
+        # Factorization only supported with scipy path
+        if self.have_cupy and factorize:
+            warnings.warn("Factorization not supported with cupy backend. Disabling factorization.")
+            factorize = False
+
+        # UMFPACK only relevant for scipy backend
+        if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
+            warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
+
         super().__init__(factorize)
 
-
     def _solver(self):
+        if self.have_cupy:
+            # GPU solver
+            def solve_gpu(A, b):
+                # Convert scipy csc -> cupy csc
+                A_gpu = cp_csc_matrix((cp.asarray(A.data),
+                                       A.indices,
+                                       A.indptr),
+                                      shape=A.shape)
+                b_gpu = cp.asarray(b)
+                x_gpu = cp_spsolve(A_gpu, b_gpu)
+                return cp.asnumpy(x_gpu)
+            return solve_gpu
+        # CPU solver
         return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
 
 # Internal Cell
@@ -810,15 +856,6 @@ class UnpaddedFDM(PDESolver):
         σ = self._get_σ(solution, p=p, u=u, binary=binary)
         σ_vm = get_σ_vm(σ)
         return u, σ, σ_vm
-
-# Internal Cell
-import torch
-import warnings
-import numpy as np
-from scipy.sparse import diags, csc_matrix
-
-from .utils import get_σ_vm
-from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly, UnpaddedFDM
 
 # Cell
 class FDM(UnpaddedFDM):
