@@ -29,6 +29,7 @@ try:
     from cupyx.scipy.sparse import csc_matrix as cp_csc_matrix
     from cupyx.scipy.sparse.linalg import spsolve as cp_spsolve
     from cupyx.scipy.sparse.linalg import cg as cg_spsolve
+    from cupyx.scipy.sparse.linalg import LinearOperator
 except ImportError:
     print("cupy is imported/used only if availabe ")
     cp = None
@@ -175,18 +176,32 @@ class SparseLinearSolver(LinearSolver):
     def _solver(self):
         if self.have_cupy:
             # GPU solver
-            def solve_gpu(A, b):
-                # Convert scipy csc -> cupy csc (all three arrays must be 1-D cupy arrays)
+            def solve_gpu(A, b, _interval=10):
+                if not hasattr(solve_gpu, "_call_count"):
+                    solve_gpu._call_count = 0
+                    solve_gpu._M = None  # cached preconditioner
+                solve_gpu._call_count += 1
+
+                # Convert scipy csc -> cupy csc
                 A_gpu = cp_csc_matrix((cp.asarray(A.data),
                                        cp.asarray(A.indices),
                                        cp.asarray(A.indptr)),
                                       shape=A.shape)
                 b_gpu = cp.asarray(b)
-                
-                x_gpu = cg_spsolve(A_gpu, b_gpu)
-                if x_gpu[1] == 0:
+
+                # Rebuild Jacobi preconditioner every _interval calls
+                if (solve_gpu._call_count % _interval) == 1:
+                    diag = A_gpu.diagonal()
+                    inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                    def mv(x):
+                        return inv_diag * x
+                    solve_gpu._M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+
+                M = solve_gpu._M
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M)
+                if info == 0:
                     # Convergence successfull
-                    return cp.asnumpy(x_gpu[0])
+                    return cp.asnumpy(x_gpu)
                 else:
                     raise ValueError("Convergence failed in cupy solver.")
                 
@@ -622,6 +637,7 @@ import torch
 import warnings
 import numpy as np
 from scipy.sparse import diags, csc_matrix
+
 
 # from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly
 from .utils import get_σ_vm
