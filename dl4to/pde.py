@@ -12,6 +12,7 @@ import warnings
 from scipy.sparse.linalg import factorized, use_solver, spsolve
 from scipy.sparse import csc_matrix
 from typing import Callable
+import pyamg
 
 try:
     use_solver(useUmfpack=True, assumeSortedIndices=True)
@@ -158,20 +159,34 @@ class SparseLinearSolver(LinearSolver):
         super().__init__(factorize)
 
     def _solver(self):
-        if self.have_cupy:
-            # GPU solver
-            def solve_gpu(A, b):
-                # Convert scipy csc -> cupy csc
-                A_gpu = cp_csc_matrix((cp.asarray(A.data),
-                                       A.indices,
-                                       A.indptr),
-                                      shape=A.shape)
-                b_gpu = cp.asarray(b)
-                x_gpu = cp_spsolve(A_gpu, b_gpu)
-                return cp.asnumpy(x_gpu)
-            return solve_gpu
-        # CPU solver
-        return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
+        def amg_solver(A, b):
+            # key = A.shape + (A.nnz,)
+            # if key not in self.ml_cache:
+            #     print("[pyamg] Building new AMG hierarchy for matrix shape", A.shape)
+            #     self.ml_cache[key] = pyamg.smoothed_aggregation_solver(A)
+            # ml = self.ml_cache[key]
+            ml = pyamg.smoothed_aggregation_solver(A.tocsr())
+            
+            x = ml.solve(b, tol=1e-10, accel='cg')
+            return x
+        return amg_solver
+
+    # def _solver(self):
+    #     if self.have_cupy:
+    #         # GPU solver
+    #         def solve_gpu(A, b):
+    #             # Convert scipy csc -> cupy csc (all three arrays must be 1-D cupy arrays)
+    #             A_gpu = cp_csc_matrix((cp.asarray(A.data),
+    #                                    cp.asarray(A.indices),
+    #                                    cp.asarray(A.indptr)),
+    #                                   shape=A.shape)
+    #             b_gpu = cp.asarray(b)
+                
+    #             x_gpu = cp_spsolve(A_gpu, b_gpu)
+    #             return cp.asnumpy(x_gpu)
+    #         return solve_gpu
+    #     # CPU solver
+    #     return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
 
 # Internal Cell
 import copy
