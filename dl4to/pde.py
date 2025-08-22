@@ -184,7 +184,12 @@ class SparseLinearSolver(LinearSolver):
                 b_gpu = cp.asarray(b)
                 
                 x_gpu = cg_spsolve(A_gpu, b_gpu)
-                return cp.asnumpy(x_gpu)
+                if x_gpu[1] == 0:
+                    # Convergence successfull
+                    return cp.asnumpy(x_gpu[0])
+                else:
+                    raise ValueError("Convergence failed in cupy solver.")
+                
             return solve_gpu
         # CPU solver
         return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
