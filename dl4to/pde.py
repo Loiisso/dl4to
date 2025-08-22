@@ -22,7 +22,7 @@ except Exception as e:
 # Internal Cell
 
 from .utils import get_σ_vm
-from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly, UnpaddedFDM
+# from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly, UnpaddedFDM
 try:
     import cupy as cp
     from cupyx.scipy.sparse import csc_matrix as cp_csc_matrix
@@ -602,7 +602,7 @@ import warnings
 import numpy as np
 from scipy.sparse import diags, csc_matrix
 
-from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly
+# from .pde import SparseLinearSolver, PDESolver, FDMDerivatives, FDMAdjointDerivatives, FDMAssembly
 from .utils import get_σ_vm
 
 # Cell
