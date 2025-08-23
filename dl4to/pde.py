@@ -154,9 +154,21 @@ class SparseLinearSolver(LinearSolver):
             warnings.warn("Factorization not supported with cupy backend. Disabling factorization.")
             factorize = False
 
+
         # UMFPACK only relevant for scipy backend
         if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
             warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
+
+        # Initialize GPU solver state at class level
+        if self.have_cupy:
+            class GPUSolverState:
+                def __init__(self):
+                    self.call_count = 0
+                    self.preconditioner = None
+                    self.last_solution = None
+                    self.last_matrix_shape = None
+            
+            self._gpu_state = GPUSolverState()  # Persistent state
 
         super().__init__(factorize)
 
@@ -175,42 +187,55 @@ class SparseLinearSolver(LinearSolver):
 
     def _solver(self):
         if self.have_cupy:
-            # GPU solver
+            # Use the persistent state object
+            state = self._gpu_state
+            
             def solve_gpu(A, b, _interval=10):
-                if not hasattr(solve_gpu, "_call_count"):
-                    solve_gpu._call_count = 0
-                    solve_gpu._M = None  # cached preconditioner
-                solve_gpu._call_count += 1
-                if not hasattr(solve_gpu, "_next_solution_guess"):
-                    solve_gpu._next_solution_guess = None
-
+                state.call_count += 1
+                
                 # Convert scipy csc -> cupy csc
                 A_gpu = cp_csc_matrix((cp.asarray(A.data),
                                        cp.asarray(A.indices),
                                        cp.asarray(A.indptr)),
                                       shape=A.shape)
                 b_gpu = cp.asarray(b)
-
-                # Rebuild Jacobi preconditioner every _interval calls
-                if (solve_gpu._call_count % _interval) == 1:
-                    print("Rebuilding Jacobi preconditioner")
+                
+                # Check if matrix shape changed (topology change)
+                matrix_changed = (state.last_matrix_shape != A.shape)
+                if matrix_changed:
+                    state.last_matrix_shape = A.shape
+                    state.last_solution = None  # invalidate solution guess
+                    state.preconditioner = None  # force rebuild
+                    print(f"Matrix shape changed to {A.shape}, invalidating cache")
+                
+                # Rebuild Jacobi preconditioner every _interval calls OR if matrix changed
+                if (state.call_count % _interval) == 1 or state.preconditioner is None:
+                    print(f"Rebuilding Jacobi preconditioner (call {state.call_count})")
                     diag = A_gpu.diagonal()
                     inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
                     def mv(x):
                         return inv_diag * x
-                    solve_gpu._M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-
-                M = solve_gpu._M
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M, x0=solve_gpu._next_solution_guess)
-                # As updates from NN tend to be pretty small, solution probably doesn't change much
-                solve_gpu._next_solution_guess = x_gpu
+                    state.preconditioner = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                
+                # Use previous solution as initial guess (if available and compatible)
+                x0 = None
+                if state.last_solution is not None and state.last_solution.shape == b_gpu.shape:
+                    x0 = state.last_solution
+                    print(f"Using warm start from previous solution")
+                
+                # Solve with CG
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=state.preconditioner, x0=x0)
+                
                 if info == 0:
-                    # Convergence successfull
+                    # Store solution for next iteration
+                    state.last_solution = x_gpu.copy()
                     return cp.asnumpy(x_gpu)
                 else:
-                    raise ValueError("Convergence failed in cupy solver.")
-                
+                    # On failure, try without initial guess
+                        raise ValueError(f"Convergence failed in cupy solver (info={info})")
+            
             return solve_gpu
+        
         # CPU solver
         return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
 
@@ -285,7 +310,7 @@ class FDMDerivatives():
     def du_dz_central(u, h):
         du = torch.zeros_like(u)
         du[:,:,:, 1:-1] = (u[:,:,:,  2:] - u[:,:,:, 0:-2]) / (2 * h[2])
-        du[:,:,:,  0  ] = (u[:,:,:,  1 ] - u[:,:,:,  0  ]) / h[2]
+        du[:,:,:,  0  ] = (u[:,:,:,  1 ] - u[:,:,:, 0  ]) / h[2]
         du[:,:,:, -1  ] = (u[:,:,:, -1 ] - u[:,:,:, -2  ]) / h[2]
         return du
 
