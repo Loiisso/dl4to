@@ -159,85 +159,82 @@ class SparseLinearSolver(LinearSolver):
         if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
             warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
 
-        # Initialize GPU solver state at class level
-        if self.have_cupy:
-            class GPUSolverState:
-                def __init__(self):
-                    self.call_count = 0
-                    self.preconditioner = None
-                    self.last_solution = None
-                    self.last_matrix_shape = None
-            
-            self._gpu_state = GPUSolverState()  # Persistent state
 
         super().__init__(factorize)
+        # Create the solver function ONCE at initialization
+        self._solver_func = self._create_solver()
 
-    # def _solver(self):
-    #     def amg_solver(A, b):
-    #         # key = A.shape + (A.nnz,)
-    #         # if key not in self.ml_cache:
-    #         #     print("[pyamg] Building new AMG hierarchy for matrix shape", A.shape)
-    #         #     self.ml_cache[key] = pyamg.smoothed_aggregation_solver(A)
-    #         # ml = self.ml_cache[key]
-    #         ml = pyamg.smoothed_aggregation_solver(A.tocsr())
-            
-    #         x = ml.solve(b, tol=1e-10, accel='cg')
-    #         return x
-    #     return amg_solver
-
-    def _solver(self):
+    def _create_solver(self):
+        """Create the solver function once with persistent state"""
         if self.have_cupy:
-            # Use the persistent state object
-            state = self._gpu_state
-            
+            # GPU solver with persistent state via closure
             def solve_gpu(A, b, _interval=10):
-                state.call_count += 1
-                
+                if not hasattr(solve_gpu, "_call_count"):
+                    solve_gpu._call_count = 0
+                    solve_gpu._M = None
+                    solve_gpu._last_solution = None  # Add previous solution storage
+                    solve_gpu._last_matrix_shape = None  # Track matrix shape changes
+                solve_gpu._call_count += 1
+
                 # Convert scipy csc -> cupy csc
                 A_gpu = cp_csc_matrix((cp.asarray(A.data),
                                        cp.asarray(A.indices),
                                        cp.asarray(A.indptr)),
                                       shape=A.shape)
                 b_gpu = cp.asarray(b)
-                
-                # Check if matrix shape changed (topology change)
-                matrix_changed = (state.last_matrix_shape != A.shape)
+
+                # Check if matrix shape changed (topology optimization changes structure)
+                matrix_changed = (solve_gpu._last_matrix_shape != A.shape)
                 if matrix_changed:
-                    state.last_matrix_shape = A.shape
-                    state.last_solution = None  # invalidate solution guess
-                    state.preconditioner = None  # force rebuild
+                    solve_gpu._last_matrix_shape = A.shape
+                    solve_gpu._last_solution = None  # invalidate solution guess
+                    solve_gpu._M = None  # force preconditioner rebuild
                     print(f"Matrix shape changed to {A.shape}, invalidating cache")
-                
+
                 # Rebuild Jacobi preconditioner every _interval calls OR if matrix changed
-                if (state.call_count % _interval) == 1 or state.preconditioner is None:
-                    print(f"Rebuilding Jacobi preconditioner (call {state.call_count})")
+                if (solve_gpu._call_count % _interval) == 1 or solve_gpu._M is None:
+                    print(f"Rebuilding Jacobi preconditioner (call {solve_gpu._call_count})")
                     diag = A_gpu.diagonal()
                     inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
                     def mv(x):
                         return inv_diag * x
-                    state.preconditioner = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                
+                    solve_gpu._M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+
                 # Use previous solution as initial guess (if available and compatible)
                 x0 = None
-                if state.last_solution is not None and state.last_solution.shape == b_gpu.shape:
-                    x0 = state.last_solution
-                    print(f"Using warm start from previous solution")
-                
+                if (solve_gpu._last_solution is not None and 
+                    solve_gpu._last_solution.shape == b_gpu.shape):
+                    x0 = solve_gpu._last_solution
+                    print(f"Using warm start from previous solution (call {solve_gpu._call_count})")
+
                 # Solve with CG
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=state.preconditioner, x0=x0)
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=solve_gpu._M, x0=x0,
+                                       tol=1e-8, atol=1e-10, maxiter=min(5000, A.shape[0]))
                 
                 if info == 0:
-                    # Store solution for next iteration
-                    state.last_solution = x_gpu.copy()
+                    # Store solution for next iteration (copy to avoid reference issues)
+                    solve_gpu._last_solution = x_gpu.copy()
                     return cp.asnumpy(x_gpu)
                 else:
-                    # On failure, try without initial guess
-                        raise ValueError(f"Convergence failed in cupy solver (info={info})")
+                    # On failure, try without warm start
+                    if x0 is not None:
+                        print(f"CG failed with warm start (info={info}), retrying without initial guess")
+                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=solve_gpu._M, x0=None,
+                                               tol=1e-8, atol=1e-10, maxiter=min(5000, A.shape[0]))
+                        if info == 0:
+                            solve_gpu._last_solution = x_gpu.copy()
+                            return cp.asnumpy(x_gpu)
+                    
+                    raise ValueError(f"Convergence failed in cupy solver (info={info})")
             
             return solve_gpu
-        
-        # CPU solver
-        return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
+        else:
+            # CPU solver
+            return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
+
+    def _solver(self):
+        """Return the persistent solver function"""
+        return self._solver_func
 
 # Internal Cell
 import copy
