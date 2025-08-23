@@ -181,6 +181,8 @@ class SparseLinearSolver(LinearSolver):
                     solve_gpu._call_count = 0
                     solve_gpu._M = None  # cached preconditioner
                 solve_gpu._call_count += 1
+                if not hasattr(solve_gpu, "_next_solution_guess"):
+                    solve_gpu._next_solution_guess = None
 
                 # Convert scipy csc -> cupy csc
                 A_gpu = cp_csc_matrix((cp.asarray(A.data),
@@ -199,7 +201,9 @@ class SparseLinearSolver(LinearSolver):
                     solve_gpu._M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
                 M = solve_gpu._M
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M)
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M, x0=solve_gpu._next_solution_guess)
+                # As updates from NN tend to be pretty small, solution probably doesn't change much
+                solve_gpu._next_solution_guess = x_gpu
                 if info == 0:
                     # Convergence successfull
                     return cp.asnumpy(x_gpu)
