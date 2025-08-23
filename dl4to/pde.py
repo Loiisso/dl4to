@@ -209,7 +209,7 @@ class SparseLinearSolver(LinearSolver):
 
                 # Solve with CG
                 x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=solve_gpu._M, x0=x0,
-                                       tol=1e-8, atol=1e-10, maxiter=min(5000, A.shape[0]))
+                                       tol=1e-8, atol=1e-10, maxiter=min(30000, A.shape[0]))
                 
                 if info == 0:
                     # Store solution for next iteration (copy to avoid reference issues)
@@ -219,7 +219,7 @@ class SparseLinearSolver(LinearSolver):
                     # On failure, try without warm start
                     if x0 is not None:
                         print(f"CG failed with warm start (info={info}), retrying without initial guess")
-                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=solve_gpu._M, x0=None, maxiter=min(30000, A.shape[0]))
+                        x_gpu, info = cg_spsolve(A_gpu, b_gpu)
                         if info == 0:
                             solve_gpu._last_solution = x_gpu.copy()
                             return cp.asnumpy(x_gpu)
