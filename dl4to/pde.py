@@ -191,6 +191,7 @@ class SparseLinearSolver(LinearSolver):
 
                 # Rebuild Jacobi preconditioner every _interval calls
                 if (solve_gpu._call_count % _interval) == 1:
+                    print("Rebuilding Jacobi preconditioner")
                     diag = A_gpu.diagonal()
                     inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
                     def mv(x):
