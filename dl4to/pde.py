@@ -183,9 +183,14 @@ class SparseLinearSolver(LinearSolver):
                                        cp.asarray(A.indptr)),
                                       shape=A.shape)
                 b_gpu = cp.asarray(b)
+                diag = A_gpu.diagonal()
+                inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                def mv(x):
+                    return inv_diag * x
+                M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
                 start_time = time.time()
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu)
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M)
                 # Ensure all GPU work is finished before timing
                 cp.cuda.get_current_stream().synchronize()
                 elapsed = time.time() - start_time
