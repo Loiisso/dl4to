@@ -184,7 +184,12 @@ class SparseLinearSolver(LinearSolver):
                                       shape=A.shape)
                 b_gpu = cp.asarray(b)
 
+                start_time = time.time()
                 x_gpu, info = cg_spsolve(A_gpu, b_gpu)
+                # Ensure all GPU work is finished before timing
+                cp.cuda.get_current_stream().synchronize()
+                elapsed = time.time() - start_time
+                print(f"[cupy][cg] solve time: {elapsed:.6f}s (info={info})")
                 if info == 0:
                     # Convergence successfull
                     return cp.asnumpy(x_gpu)
