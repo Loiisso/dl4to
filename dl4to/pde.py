@@ -144,7 +144,7 @@ class SparseLinearSolver(LinearSolver):
                  use_cupy: bool = True,
                  cg_tol: float = 1e-6,
                  cg_max_iter: int = None,
-                 cg_verbose: bool = False,
+                 cg_verbose: bool = True,
                  warm_start: bool = True,
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 5e-3,            # Relative L2 change tolerance on θ for warm reuse
