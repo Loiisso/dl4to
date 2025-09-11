@@ -149,7 +149,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'block_jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
+                 preconditioner: str = 'amg',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -278,64 +278,82 @@ class SparseLinearSolver(LinearSolver):
                     if n_dofs % 3 != 0:
                         # Fallback to scalar Jacobi if unexpected shape
                         diag = A_gpu.diagonal()
-                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        inv_diag = cp.where(cp.abs(diag) > 1e-12, 1.0 / diag, 1.0)
                         def mv(x):
                             return inv_diag * x
                         M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                     else:
                         N = n_dofs // 3
-                        diag = A_gpu.diagonal()
-                        d0 = diag[0:N]
-                        d1 = diag[N:2*N]
-                        d2 = diag[2*N:3*N]
-                        # Extract coupling terms between same voxel DOFs (u_x,u_y,u_z)
-                        # Use COO traversal once
-                        coo = A_gpu.tocoo()
-                        row = coo.row; col = coo.col; data = coo.data
-                        off01 = cp.zeros(N, dtype=A_gpu.dtype)
-                        off02 = cp.zeros(N, dtype=A_gpu.dtype)
-                        off12 = cp.zeros(N, dtype=A_gpu.dtype)
-                        # Patterns (x,y): (k, N+k) or (N+k, k)
-                        mask_xy = ((row < N) & (col == row + N)) | ((col < N) & (row == col + N))
-                        if mask_xy.any():
-                            r_xy = row[mask_xy]; c_xy = col[mask_xy]
-                            val_xy = data[mask_xy]
-                            # Map to voxel index
-                            idx_xy = cp.where(r_xy < N, r_xy, c_xy)
-                            off01[idx_xy] = val_xy
-                        # (x,z)
-                        mask_xz = ((row < N) & (col == row + 2*N)) | ((col < N) & (row == col + 2*N))
-                        if mask_xz.any():
-                            r_xz = row[mask_xz]; c_xz = col[mask_xz]; val_xz = data[mask_xz]
-                            idx_xz = cp.where(r_xz < N, r_xz, c_xz)
-                            off02[idx_xz] = val_xz
-                        # (y,z)
-                        mask_yz = (((row >= N) & (row < 2*N)) & (col == row + N)) | (((col >= N) & (col < 2*N)) & (row == col + N))
-                        if mask_yz.any():
-                            r_yz = row[mask_yz]; c_yz = col[mask_yz]; val_yz = data[mask_yz]
-                            idx_yz = cp.where((r_yz >= N) & (r_yz < 2*N), r_yz - N, c_yz - N)
-                            off12[idx_yz] = val_yz
-                        # Build per-voxel symmetric blocks:
-                        a = d0; d = d1; f = d2
-                        b = off01; c_ = off02; e = off12
-                        # det = a*d*f + 2*b*c_*e - a*e^2 - d*c_^2 - f*b^2
-                        det = a*d*f + 2*b*c_*e - a*e*e - d*c_*c_ - f*b*b
-                        # Avoid singular: replace zeros
-                        det_safe = cp.where(cp.abs(det) < 1e-12, 1e-12, det)
-                        inv00 = (d*f - e*e) / det_safe
-                        inv11 = (a*f - c_*c_) / det_safe
-                        inv22 = (a*d - b*b) / det_safe
-                        inv01 = (c_*e - b*f) / det_safe
-                        inv02 = (b*e - c_*d) / det_safe
-                        inv12 = (b*c_ - a*e) / det_safe
-                        # matvec applying inverse blocks
+                        
+                        # Preallocate arrays for block elements
+                        blocks = [cp.zeros((N, 3, 3), dtype=A_gpu.dtype) for _ in range(N)]
+                        
+                        # Extract blocks more efficiently using CSR format
+                        csr = A_gpu.tocsr()
+                        
+                        # Loop through each voxel to build its 3×3 block
+                        for i in range(N):
+                            # Indices for this voxel's DOFs
+                            idx = [i, i+N, i+2*N]
+                            
+                            # Extract the 3×3 block for this voxel
+                            for r in range(3):
+                                row_start = csr.indptr[idx[r]]
+                                row_end = csr.indptr[idx[r] + 1]
+                                cols = csr.indices[row_start:row_end]
+                                data = csr.data[row_start:row_end]
+                                
+                                for j in range(len(cols)):
+                                    col = cols[j]
+                                    if col == idx[0]:
+                                        blocks[i][r, 0] = data[j]
+                                    elif col == idx[1]:
+                                        blocks[i][r, 1] = data[j]
+                                    elif col == idx[2]:
+                                        blocks[i][r, 2] = data[j]
+                        
+                        # Compute inverse of each block
+                        inv_blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                        for i in range(N):
+                            A = blocks[i]
+                            # Calculate determinant
+                            det = (A[0,0] * (A[1,1] * A[2,2] - A[1,2] * A[2,1]) -
+                                A[0,1] * (A[1,0] * A[2,2] - A[1,2] * A[2,0]) +
+                                A[0,2] * (A[1,0] * A[2,1] - A[1,1] * A[2,0]))
+                            
+                            # Handle small determinants
+                            if cp.abs(det) > 1e-12:
+                                # Adjugate matrix with correct signs
+                                inv_blocks[i][0,0] = (A[1,1] * A[2,2] - A[1,2] * A[2,1]) / det
+                                inv_blocks[i][0,1] = (A[0,2] * A[2,1] - A[0,1] * A[2,2]) / det  # Note the sign
+                                inv_blocks[i][0,2] = (A[0,1] * A[1,2] - A[0,2] * A[1,1]) / det
+                                inv_blocks[i][1,0] = (A[1,2] * A[2,0] - A[1,0] * A[2,2]) / det  # Note the sign
+                                inv_blocks[i][1,1] = (A[0,0] * A[2,2] - A[0,2] * A[2,0]) / det
+                                inv_blocks[i][1,2] = (A[0,2] * A[1,0] - A[0,0] * A[1,2]) / det  # Note the sign
+                                inv_blocks[i][2,0] = (A[1,0] * A[2,1] - A[1,1] * A[2,0]) / det
+                                inv_blocks[i][2,1] = (A[0,1] * A[2,0] - A[0,0] * A[2,1]) / det  # Note the sign
+                                inv_blocks[i][2,2] = (A[0,0] * A[1,1] - A[0,1] * A[1,0]) / det
+                            else:
+                                # Use a more robust fallback for nearly singular blocks
+                                # Simple approach: identity matrix scaled by trace
+                                trace = A[0,0] + A[1,1] + A[2,2]
+                                scale = 1.0 / max(abs(trace), 1e-12)
+                                inv_blocks[i] = cp.eye(3, dtype=A_gpu.dtype) * scale
+                        
+                        # Create operator
                         def mv(x):
-                            # x layout: [x0..xN-1, y0.., z0..]
-                            x0 = x[0:N]; x1 = x[N:2*N]; x2 = x[2*N:3*N]
-                            z0 = inv00 * x0 + inv01 * x1 + inv02 * x2
-                            z1 = inv01 * x0 + inv11 * x1 + inv12 * x2
-                            z2 = inv02 * x0 + inv12 * x1 + inv22 * x2
-                            return cp.concatenate([z0, z1, z2])
+                            result = cp.zeros_like(x)
+                            for i in range(N):
+                                # Extract this voxel's DOFs
+                                xi = x[i]; yi = x[i+N]; zi = x[i+2*N]
+                                
+                                # Apply block inverse
+                                result[i] = inv_blocks[i][0,0] * xi + inv_blocks[i][0,1] * yi + inv_blocks[i][0,2] * zi
+                                result[i+N] = inv_blocks[i][1,0] * xi + inv_blocks[i][1,1] * yi + inv_blocks[i][1,2] * zi
+                                result[i+2*N] = inv_blocks[i][2,0] * xi + inv_blocks[i][2,1] * yi + inv_blocks[i][2,2] * zi
+                                
+                            return result
+                        
                         M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                         if self.cg_verbose:
                             print(f"[cupy][cg] block_jacobi built (N={N})")
