@@ -273,10 +273,9 @@ class SparseLinearSolver(LinearSolver):
                         return inv_diag * x
                     M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                 elif self.preconditioner == 'block_jacobi':
-                        def create_block_jacobi_preconditioner(A_gpu):
+                        def create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu):
                             n_dofs = A_gpu.shape[0]
                             if n_dofs % 3 != 0:
-                                # Fallback to scalar Jacobi if unexpected shape
                                 diag = A_gpu.diagonal()
                                 inv_diag = cp.where(cp.abs(diag) > 1e-12, 1.0 / diag, 0.0)
                                 def mv(x):
@@ -284,90 +283,69 @@ class SparseLinearSolver(LinearSolver):
                                 return LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
                             N = n_dofs // 3
-                            # Store 9 arrays for 3x3 block entries over all voxels
-                            block_vals = [cp.zeros(N, dtype=A_gpu.dtype) for _ in range(9)]
-                            diag = A_gpu.diagonal()
-                            block_vals[0] = diag[0:N]      # (0,0)
-                            block_vals[4] = diag[N:2*N]    # (1,1)
-                            block_vals[8] = diag[2*N:3*N]  # (2,2)
+                            blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                            csr = A_gpu.tocsr()
+                            t0 = time.time()
+                            if self.cg_verbose:
+                                print(f"[cupy][cg][block_jacobi] start build N={N} nnz={A_gpu.nnz}")
+                            step_nodes = max(1, N // 8)
+                            for i_node in range(N):
+                                base_row = 3 * i_node
+                                for r in range(3):
+                                    row_idx = base_row + r
+                                    row_start = csr.indptr[row_idx]
+                                    row_end = csr.indptr[row_idx + 1]
+                                    cols = csr.indices[row_start:row_end]
+                                    vals = csr.data[row_start:row_end]
+                                    # Gather this node's 3 columns
+                                    for c in range(3):
+                                        col_idx = base_row + c
+                                        matches = (cols == col_idx)
+                                        if cp.any(matches):
+                                            blocks[i_node, r, c] = vals[matches][0]
+                                if self.cg_verbose and N > 50 and (i_node % step_nodes == 0 or i_node == N - 1):
+                                    pct = 100.0 * (i_node + 1) / N
+                                    print(f"[cupy][cg][block_jacobi] build {pct:5.1f}% ({i_node+1}/{N})")
 
-                            coo = A_gpu.tocoo()
-                            row = coo.row; col = coo.col; data = coo.data
-
-                            # (x,y) couplings
-                            mask_xy = ((row < N) & (col >= N) & (col < 2*N)) | ((col < N) & (row >= N) & (row < 2*N))
-                            if mask_xy.any():
-                                r_xy = row[mask_xy]; c_xy = col[mask_xy]; val_xy = data[mask_xy]
-                                for k in range(len(r_xy)):
-                                    r = r_xy[k]; c = c_xy[k]; v = val_xy[k]
-                                    if r < N:      # (0,1)
-                                        block_vals[1][r] = v
-                                    else:          # (1,0)
-                                        block_vals[3][c] = v
-
-                            # (x,z) couplings
-                            mask_xz = ((row < N) & (col >= 2*N)) | ((col < N) & (row >= 2*N))
-                            if mask_xz.any():
-                                r_xz = row[mask_xz]; c_xz = col[mask_xz]; val_xz = data[mask_xz]
-                                for k in range(len(r_xz)):
-                                    r = r_xz[k]; c = c_xz[k]; v = val_xz[k]
-                                    if r < N:      # (0,2)
-                                        block_vals[2][r] = v
-                                    else:          # (2,0)
-                                        block_vals[6][c] = v
-
-                            # (y,z) couplings
-                            mask_yz = ((row >= N) & (row < 2*N) & (col >= 2*N)) | ((col >= N) & (col < 2*N) & (row >= 2*N))
-                            if mask_yz.any():
-                                r_yz = row[mask_yz]; c_yz = col[mask_yz]; val_yz = data[mask_yz]
-                                for k in range(len(r_yz)):
-                                    r = r_yz[k]; c = c_yz[k]; v = val_yz[k]
-                                    if r < 2*N:    # (1,2)
-                                        block_vals[5][r-N] = v
-                                    else:          # (2,1)
-                                        block_vals[7][c-N] = v
-
-                            # Enforce symmetry by averaging opposing entries
-                            for i_sym in range(N):
-                                if block_vals[1][i_sym] != block_vals[3][i_sym]:
-                                    avg = (block_vals[1][i_sym] + block_vals[3][i_sym]) / 2
-                                    block_vals[1][i_sym] = block_vals[3][i_sym] = avg
-                                if block_vals[2][i_sym] != block_vals[6][i_sym]:
-                                    avg = (block_vals[2][i_sym] + block_vals[6][i_sym]) / 2
-                                    block_vals[2][i_sym] = block_vals[6][i_sym] = avg
-                                if block_vals[5][i_sym] != block_vals[7][i_sym]:
-                                    avg = (block_vals[5][i_sym] + block_vals[7][i_sym]) / 2
-                                    block_vals[5][i_sym] = block_vals[7][i_sym] = avg
-
-                            a = block_vals[0]; b = block_vals[1]; c_ = block_vals[2]
-                            d = block_vals[4]; e = block_vals[5]; f = block_vals[8]
-                            det = a*d*f + 2*b*c_*e - a*e*e - d*c_*c_ - f*b*b
+                            a = blocks[:, 0, 0]; b = blocks[:, 0, 1]; c_ = blocks[:, 0, 2]
+                            d = blocks[:, 1, 0]; e = blocks[:, 1, 1]; f = blocks[:, 1, 2]
+                            g = blocks[:, 2, 0]; h = blocks[:, 2, 1]; i_ = blocks[:, 2, 2]
+                            det = (a * (e * i_ - f * h) - b * (d * i_ - f * g) + c_ * (d * h - e * g))
                             det_safe = cp.where(cp.abs(det) > 1e-12, det, cp.sign(det) * 1e-12)
-                            inv00 = (d*f - e*e) / det_safe
-                            inv01 = (c_*e - b*f) / det_safe
-                            inv02 = (b*e - c_*d) / det_safe
-                            inv11 = (a*f - c_*c_) / det_safe
-                            inv12 = (b*c_ - a*e) / det_safe
-                            inv22 = (a*d - b*b) / det_safe
-                            # Correct signs
-                            inv01 = -inv01
-                            inv12 = -inv12
-                            inv10 = -inv01
-                            inv20 = inv02
-                            inv21 = -inv12
+                            if self.cg_verbose:
+                                det_abs = cp.abs(det)
+                                det_min = float(det_abs.min().get()) if det_abs.size else 0.0
+                                det_max = float(det_abs.max().get()) if det_abs.size else 0.0
+                                det_mean = float(det_abs.mean().get()) if det_abs.size else 0.0
+                                near = int((det_abs < 1e-12).sum().get())
+                                print(f"[cupy][cg][block_jacobi] det stats |min|={det_min:.3e} |max|={det_max:.3e} |mean|={det_mean:.3e} near_sing={near}")
+
+                            inv_blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                            inv_blocks[:, 0, 0] = (e * i_ - f * h) / det_safe
+                            inv_blocks[:, 0, 1] = (c_ * h - b * i_) / det_safe
+                            inv_blocks[:, 0, 2] = (b * f - c_ * e) / det_safe
+                            inv_blocks[:, 1, 0] = (f * g - d * i_) / det_safe
+                            inv_blocks[:, 1, 1] = (a * i_ - c_ * g) / det_safe
+                            inv_blocks[:, 1, 2] = (c_ * d - a * f) / det_safe
+                            inv_blocks[:, 2, 0] = (d * h - e * g) / det_safe
+                            inv_blocks[:, 2, 1] = (b * g - a * h) / det_safe
+                            inv_blocks[:, 2, 2] = (a * e - b * d) / det_safe
 
                             def mv(x):
-                                x0 = x[0:N]; x1 = x[N:2*N]; x2 = x[2*N:3*N]
-                                z0 = inv00 * x0 + inv01 * x1 + inv02 * x2
-                                z1 = inv10 * x0 + inv11 * x1 + inv12 * x2
-                                z2 = inv20 * x0 + inv21 * x1 + inv22 * x2
-                                return cp.concatenate([z0, z1, z2])
+                                x_mat = x.reshape((N, 3))
+                                res = cp.zeros_like(x_mat)
+                                for rr in range(3):
+                                    for cc in range(3):
+                                        res[:, rr] += inv_blocks[:, rr, cc] * x_mat[:, cc]
+                                return res.reshape(n_dofs)
 
+                            if self.cg_verbose:
+                                print(f"[cupy][cg][block_jacobi] build done in {time.time()-t0:.3f}s")
                             return LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
-                        M = create_block_jacobi_preconditioner(A_gpu)
+                        M = create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu)
                         if self.cg_verbose:
-                            print(f"[cupy][cg] block_jacobi built (N={A_gpu.shape[0]//3})")
+                            print(f"[cupy][cg] block_jacobi (interleaved) built (N={A_gpu.shape[0]//3})")
                 elif self.preconditioner == 'amg':
                     # Lightweight approximate AMG: repeated damped Jacobi smoothing as inverse apply.
                     # Reuse diagonal inverse if sparsity pattern unchanged.
