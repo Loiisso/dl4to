@@ -48,12 +48,15 @@ class AutogradLinearSolver(torch.autograd.Function):
         torch.Tensor
         """
         np_b = b.cpu().numpy()
+        # Explicit phase label
+        phase = 'forward'
 
         if factorize:
             solver = factorized(A_mat)
             x = solver(np_b)
         else:
-            x = solver(A_mat, np_b)
+            # pass phase explicitly
+            x = solver(A_mat, np_b, phase=phase)
 
         x = torch.from_numpy(x.astype(np_b.dtype))
         ctx.save_for_backward(θ, x, b)
@@ -79,12 +82,13 @@ class AutogradLinearSolver(torch.autograd.Function):
         θ.requires_grad_(True)
 
         with torch.no_grad():
+            phase = 'adjoint'
             flat_np_grad_output = grad_output.flatten().cpu().numpy()
 
             if factorize:
                 y = solver(flat_np_grad_output)
             else:
-                y = solver(A_mat, flat_np_grad_output)
+                y = solver(A_mat, flat_np_grad_output, phase=phase)
 
             y = torch.from_numpy(y).clone().requires_grad_(False)
             x = x.clone().requires_grad_(False)
@@ -128,16 +132,38 @@ class SparseLinearSolver(LinearSolver):
     A sparse linear solver that uses scipy (CPU) and optionally cupy (GPU) if available.
     """
     def __init__(self,
-                 use_umfpack:bool=True,      # Whether to use umfpack on CPU.
-                 factorize:bool=False,       # Whether to factorize (CPU only).
-                 use_cupy:bool=True          # Try to use cupy when CUDA + cupy available.
-                ):
+                 use_umfpack: bool = True,
+                 factorize: bool = False,
+                 use_cupy: bool = True,
+                 cg_tol: float = 1e-6,
+                 cg_max_iter: int = None,
+                 cg_verbose: bool = False,
+                 warm_start: bool = True,
+                 warm_similarity_threshold: float = 0.9  # Stricter for phase separation safety
+                 ):
+        # Basic config
         self.use_umfpack = use_umfpack
         self.use_cupy_requested = use_cupy
         self.have_cupy = False
         self.backend = "scipy"
+        self.cg_tol = cg_tol
+        self.cg_max_iter = cg_max_iter
+        self.cg_verbose = cg_verbose
+        self.warm_start = warm_start
+        self.warm_similarity_threshold = warm_similarity_threshold
 
-        # Check cupy availability
+        # GPU structural cache
+        self._gpu_shape = None
+        self._gpu_indices = None
+        self._gpu_indptr = None
+
+        # Phase separated warm caches: {'forward': {'x': cp.array, 'b': cp.array}, 'adjoint': {...}}
+        self._warm_cache = {
+            'forward': {'x': None, 'b': None},
+            'adjoint': {'x': None, 'b': None}
+        }
+
+        # Cupy availability
         if use_cupy:
             try:
                 import cupy  # noqa: F401
@@ -149,12 +175,11 @@ class SparseLinearSolver(LinearSolver):
             except ImportError:
                 warnings.warn("cupy not installed; falling back to scipy backend.")
 
-        # Factorization only supported with scipy path
+        # Factorization only for CPU
         if self.have_cupy and factorize:
             warnings.warn("Factorization not supported with cupy backend. Disabling factorization.")
             factorize = False
 
-        # UMFPACK only relevant for scipy backend
         if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
             warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
 
@@ -176,34 +201,76 @@ class SparseLinearSolver(LinearSolver):
     def _solver(self):
         if self.have_cupy:
             # GPU solver
-            def solve_gpu(A, b):
-                # Convert scipy csc -> cupy csc
-                A_gpu = cp_csc_matrix((cp.asarray(A.data),
-                                       cp.asarray(A.indices),
-                                       cp.asarray(A.indptr)),
-                                      shape=A.shape)
-                b_gpu = cp.asarray(b)
+            def solve_gpu(A, b, phase='forward'):
+                # (1) Upload / reuse sparsity pattern
+                # Reuse indices/indptr if shape unchanged to avoid repeated allocations
+                if (self._gpu_shape != A.shape) or (self._gpu_indices is None) or (self._gpu_indptr is None):
+                    self._gpu_shape = A.shape
+                    self._gpu_indices = cp.asarray(A.indices)
+                    self._gpu_indptr = cp.asarray(A.indptr)
+                # Always upload fresh numeric values (data changes each call)
+                data_gpu = cp.asarray(A.data)
+                A_gpu = cp_csc_matrix((data_gpu, self._gpu_indices, self._gpu_indptr), shape=A.shape)
+
+                # (2) Build simple Jacobi preconditioner (inv diagonal)
                 diag = A_gpu.diagonal()
                 inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
                 def mv(x):
                     return inv_diag * x
                 M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
+                # (3) RHS & warm start
+                b_gpu = cp.asarray(b)
+
+                cache = self._warm_cache.get(phase, {'x': None, 'b': None})
+
+                x0 = None
+                if self.warm_start and cache['x'] is not None and cache['x'].shape[0] == b_gpu.shape[0]:
+                    if cache['b'] is not None:
+                        bn = cp.linalg.norm(b_gpu)
+                        bln = cp.linalg.norm(cache['b'])
+                        if bn > 0 and bln > 0:
+                            cos_sim = float(cp.dot(b_gpu, cache['b']) / (bn * bln))
+                            if cos_sim >= self.warm_similarity_threshold:
+                                x0 = cache['x']
+                            elif self.cg_verbose:
+                                print(f"[cupy][cg] warm skip phase={phase} cos={cos_sim:.3f} < {self.warm_similarity_threshold}")
+                        else:
+                            # Zero RHS edge case; allow reuse (will converge fast anyway)
+                            x0 = cache['x']
+                    else:
+                        x0 = cache['x']
+
+                # Heuristic for max_iter if unspecified: 2 * sqrt(n) (rough) capped at 10k
+                max_iter = self.cg_max_iter
+                if max_iter is None:
+                    n = b_gpu.shape[0]
+                    max_iter = int(min(10000, max(1000, 2 * int(cp.sqrt(n)))))
+
                 start_time = time.time()
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu, M=M)
-                # Ensure all GPU work is finished before timing
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M)
                 cp.cuda.get_current_stream().synchronize()
                 elapsed = time.time() - start_time
-                print(f"[cupy][cg] solve time: {elapsed:.6f}s (info={info})")
-                if info == 0:
-                    # Convergence successfull
-                    return cp.asnumpy(x_gpu)
-                else:
-                    raise ValueError("Convergence failed in cupy solver.")
+
+                if info != 0:
+                    # info > 0 -> convergence not achieved within max_iter, info < 0 -> illegal input
+                    raise RuntimeError(f"[cupy][cg] convergence failed (info={info}) after {elapsed:.3f}s; consider increasing max_iter or relaxing tol.")
+
+                # Cache warm start
+                if self.warm_start:
+                    # Update phase cache
+                    cache['x'] = x_gpu
+                    cache['b'] = b_gpu
+                    self._warm_cache[phase] = cache
+
+                if self.cg_verbose:
+                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it<={max_iter} warm={'y' if x0 is not None else 'n'}")
+
+                return cp.asnumpy(x_gpu)
                 
             return solve_gpu
-        # CPU solver
-        return lambda A, b: spsolve(A, b, use_umfpack=self.use_umfpack)
+        # CPU solver (ignore phase)
+        return lambda A, b, phase='forward': spsolve(A, b, use_umfpack=self.use_umfpack)
 
 # Internal Cell
 import copy
