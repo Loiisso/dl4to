@@ -241,11 +241,12 @@ class SparseLinearSolver(LinearSolver):
                     else:
                         x0 = cache['x']
 
-                # Heuristic for max_iter if unspecified: 2 * sqrt(n) (rough) capped at 10k
+                
                 max_iter = self.cg_max_iter
-                if max_iter is None:
-                    n = b_gpu.shape[0]
-                    max_iter = int(min(10000, max(1000, 2 * int(cp.sqrt(n)))))
+                # Heuristic for max_iter if unspecified: 2 * sqrt(n) (rough) capped at 10k
+                # if max_iter is None:
+                #     n = b_gpu.shape[0]
+                #     max_iter = int(min(10000, max(1000, 2 * int(cp.sqrt(n)))))
 
                 start_time = time.time()
                 x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M)
