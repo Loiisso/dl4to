@@ -148,7 +148,8 @@ class SparseLinearSolver(LinearSolver):
                  warm_start: bool = True,
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
-                 warm_strategy: str = 'theta'             # 'theta' | 'rhs' | 'both'
+                 warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
+                 preconditioner: str = 'block_jacobi'           # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
                  ):
         # Basic config
         self.use_umfpack = use_umfpack
@@ -164,6 +165,13 @@ class SparseLinearSolver(LinearSolver):
         self.warm_strategy = warm_strategy.lower()
         if self.warm_strategy not in ['theta', 'rhs', 'both']:
             raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
+        self.preconditioner = preconditioner.lower()
+        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg']:
+            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', or 'amg'")
+
+        # AMG cache (CPU pattern reuse)
+        self._amg_hierarchy = None
+        self._amg_key = None
 
         # GPU structural cache
         self._gpu_shape = None
@@ -192,6 +200,15 @@ class SparseLinearSolver(LinearSolver):
         if self.have_cupy and factorize:
             warnings.warn("Factorization not supported with cupy backend. Disabling factorization.")
             factorize = False
+
+        # If GPU: we'll implement a lightweight approximate AMG (multi-step Jacobi inverse) directly
+        if self.preconditioner == 'amg' and self.have_cupy:
+            if self.cg_verbose:
+                print("[amg] GPU approximate AMG enabled (multi-step Jacobi smoother).")
+
+        if self.preconditioner == 'amg' and factorize:
+            warnings.warn("AMG conflicts with direct factorization; switching to iterative (factorize=False).")
+            self.factorize = False
 
         if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
             warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
@@ -234,12 +251,99 @@ class SparseLinearSolver(LinearSolver):
                 data_gpu = cp.asarray(A.data)
                 A_gpu = cp_csc_matrix((data_gpu, self._gpu_indices, self._gpu_indptr), shape=A.shape)
 
-                # (2) Build simple Jacobi preconditioner (inv diagonal)
-                diag = A_gpu.diagonal()
-                inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
-                def mv(x):
-                    return inv_diag * x
-                M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                # (2) Build / select preconditioner
+                M = None
+                if self.preconditioner == 'none':
+                    M = None
+                elif self.preconditioner == 'jacobi':
+                    diag = A_gpu.diagonal()
+                    inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                    def mv(x):
+                        return inv_diag * x
+                    M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                elif self.preconditioner == 'block_jacobi':
+                    # Symmetric 3x3 block Jacobi (approx) assuming DOF ordering [u_x_all, u_y_all, u_z_all]
+                    n_dofs = A_gpu.shape[0]
+                    if n_dofs % 3 != 0:
+                        # Fallback to scalar Jacobi if unexpected shape
+                        diag = A_gpu.diagonal()
+                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        def mv(x):
+                            return inv_diag * x
+                        M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                    else:
+                        N = n_dofs // 3
+                        diag = A_gpu.diagonal()
+                        d0 = diag[0:N]
+                        d1 = diag[N:2*N]
+                        d2 = diag[2*N:3*N]
+                        # Extract coupling terms between same voxel DOFs (u_x,u_y,u_z)
+                        # Use COO traversal once
+                        coo = A_gpu.tocoo()
+                        row = coo.row; col = coo.col; data = coo.data
+                        off01 = cp.zeros(N, dtype=A_gpu.dtype)
+                        off02 = cp.zeros(N, dtype=A_gpu.dtype)
+                        off12 = cp.zeros(N, dtype=A_gpu.dtype)
+                        # Patterns (x,y): (k, N+k) or (N+k, k)
+                        mask_xy = ((row < N) & (col == row + N)) | ((col < N) & (row == col + N))
+                        if mask_xy.any():
+                            r_xy = row[mask_xy]; c_xy = col[mask_xy]
+                            val_xy = data[mask_xy]
+                            # Map to voxel index
+                            idx_xy = cp.where(r_xy < N, r_xy, c_xy)
+                            off01[idx_xy] = val_xy
+                        # (x,z)
+                        mask_xz = ((row < N) & (col == row + 2*N)) | ((col < N) & (row == col + 2*N))
+                        if mask_xz.any():
+                            r_xz = row[mask_xz]; c_xz = col[mask_xz]; val_xz = data[mask_xz]
+                            idx_xz = cp.where(r_xz < N, r_xz, c_xz)
+                            off02[idx_xz] = val_xz
+                        # (y,z)
+                        mask_yz = (((row >= N) & (row < 2*N)) & (col == row + N)) | (((col >= N) & (col < 2*N)) & (row == col + N))
+                        if mask_yz.any():
+                            r_yz = row[mask_yz]; c_yz = col[mask_yz]; val_yz = data[mask_yz]
+                            idx_yz = cp.where((r_yz >= N) & (r_yz < 2*N), r_yz - N, c_yz - N)
+                            off12[idx_yz] = val_yz
+                        # Build per-voxel symmetric blocks:
+                        a = d0; d = d1; f = d2
+                        b = off01; c_ = off02; e = off12
+                        # det = a*d*f + 2*b*c_*e - a*e^2 - d*c_^2 - f*b^2
+                        det = a*d*f + 2*b*c_*e - a*e*e - d*c_*c_ - f*b*b
+                        # Avoid singular: replace zeros
+                        det_safe = cp.where(cp.abs(det) < 1e-12, 1e-12, det)
+                        inv00 = (d*f - e*e) / det_safe
+                        inv11 = (a*f - c_*c_) / det_safe
+                        inv22 = (a*d - b*b) / det_safe
+                        inv01 = (c_*e - b*f) / det_safe
+                        inv02 = (b*e - c_*d) / det_safe
+                        inv12 = (b*c_ - a*e) / det_safe
+                        # matvec applying inverse blocks
+                        def mv(x):
+                            # x layout: [x0..xN-1, y0.., z0..]
+                            x0 = x[0:N]; x1 = x[N:2*N]; x2 = x[2*N:3*N]
+                            z0 = inv00 * x0 + inv01 * x1 + inv02 * x2
+                            z1 = inv01 * x0 + inv11 * x1 + inv12 * x2
+                            z2 = inv02 * x0 + inv12 * x1 + inv22 * x2
+                            return cp.concatenate([z0, z1, z2])
+                        M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                        if self.cg_verbose:
+                            print(f"[cupy][cg] block_jacobi built (N={N})")
+                elif self.preconditioner == 'amg':
+                    # Approximate AMG: k steps of damped Jacobi as an explicit approximate inverse apply.
+                    diag = A_gpu.diagonal()
+                    inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                    ω = 0.8
+                    k_smooth = 4  # number of smoothing (inverse approximation) iterations
+                    def mv(x):
+                        # Solve approximately A y = x using k Jacobi iterations starting y=0.
+                        y = cp.zeros_like(x)
+                        for _ in range(k_smooth):
+                            r_loc = x - A_gpu @ y
+                            y = y + ω * inv_diag * r_loc
+                        return y
+                    M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                    if self.cg_verbose:
+                        print(f"[cupy][cg] amg approx inverse: k={k_smooth} ω={ω}")
 
                 # (3) RHS & warm start
                 b_gpu = cp.asarray(b)
@@ -328,12 +432,29 @@ class SparseLinearSolver(LinearSolver):
                     self._warm_cache[phase] = cache
 
                 if self.cg_verbose:
-                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it<={max_iter} warm={'y' if x0 is not None else 'n'}")
+                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it<={max_iter} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
 
                 return cp.asnumpy(x_gpu)
                 
             return solve_gpu
-        # CPU solver (ignore phase) - accept θ_current for interface consistency
+        # CPU solver (iterative / direct depending on config)
+        if self.preconditioner == 'amg':
+            def solve_cpu_amg(A, b, phase='forward', θ_current=None):
+                # Key by shape + nnz; if nnz unchanged assume pattern stable
+                key = (A.shape, A.nnz)
+                build = (self._amg_hierarchy is None) or (self._amg_key != key)
+                if build:
+                    if self.cg_verbose:
+                        print(f"[amg] building hierarchy shape={A.shape} nnz={A.nnz}")
+                    self._amg_hierarchy = pyamg.smoothed_aggregation_solver(A.tocsr())
+                    self._amg_key = key
+                # Use acceleration 'cg' with target tolerance (may differ from pyamg's internal default)
+                x = self._amg_hierarchy.solve(b, tol=self.cg_tol, accel='cg')
+                if self.cg_verbose:
+                    print(f"[amg] solve phase={phase} tol={self.cg_tol}")
+                return x
+            return solve_cpu_amg
+        # Default CPU direct solve
         return lambda A, b, phase='forward', θ_current=None: spsolve(A, b, use_umfpack=self.use_umfpack)
 
 # Internal Cell
