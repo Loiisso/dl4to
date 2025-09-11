@@ -149,7 +149,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'amg',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
+                 preconditioner: str = 'block_jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -183,6 +183,37 @@ class SparseLinearSolver(LinearSolver):
         self.amg_omega = amg_omega
         self.amg_adaptive = amg_adaptive
         self.amg_min_smooth_steps = amg_min_smooth_steps
+        # Block-Jacobi cache config
+        self.bj_cache = True
+        self.bj_theta_tol = 1e-3
+        self.bj_rebuild_every = 0  # 0 disables periodic rebuild
+        # Cached state for block-jacobi (interleaved)
+        self._bj_cache = {
+            'key': None,             # pattern key
+            'offsets': None,         # cp.ndarray (N,3,3) absolute indices into csr.data (-1 if missing)
+            'inv_blocks': None,      # cp.ndarray (N,3,3)
+            'operator': None,        # LinearOperator capturing inv_blocks reference
+            'theta_prev': None,      # cp.ndarray (N,)
+            'N': 0,                  # number of nodes
+            'build_count': 0         # times rebuilt fully
+        }
+        # Auto-freeze/unfreeze controls for BJ updates
+        self.bj_freeze_enabled = True
+        self.bj_freeze_patience = 3          # consecutive small-Δθ steps to freeze
+        self.bj_freeze_theta_tol = 1e-4      # mean(θ) change threshold to count as "stable"
+        self.bj_unfreeze_iter_jump = 1.5     # if CG iters jump by this factor vs baseline, unfreeze
+        self._bj_freeze_state = {
+            'frozen': False,
+            'stable_steps': 0,
+            'prev_mean': None,
+            'baseline_iters': None,
+            'step': 0
+        }
+        # Partial update controls
+        self.bj_update_fraction = 0.2       # update at most 20% nodes per refresh
+        self.bj_min_update = 4096           # but at least this many nodes
+        self.bj_update_period = 1           # perform value update every k solves (1 = every time)
+        self.bj_partitions = 1              # round-robin partitions (1 = disabled)
 
         # GPU structural cache
         self._gpu_shape = None
@@ -273,7 +304,7 @@ class SparseLinearSolver(LinearSolver):
                         return inv_diag * x
                     M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                 elif self.preconditioner == 'block_jacobi':
-                        def create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu):
+                        def create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu, theta_vec=None):
                             n_dofs = A_gpu.shape[0]
                             if n_dofs % 3 != 0:
                                 diag = A_gpu.diagonal()
@@ -283,67 +314,216 @@ class SparseLinearSolver(LinearSolver):
                                 return LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
 
                             N = n_dofs // 3
-                            blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                            # Pattern key using cheap hashes on indices/indptr
                             csr = A_gpu.tocsr()
-                            t0 = time.time()
-                            if self.cg_verbose:
-                                print(f"[cupy][cg][block_jacobi] start build N={N} nnz={A_gpu.nnz}")
-                            step_nodes = max(1, N // 8)
-                            for i_node in range(N):
-                                base_row = 3 * i_node
+                            try:
+                                key = (A_gpu.shape,
+                                       int(A_gpu.nnz),
+                                       int(csr.indptr.size), int(csr.indices.size),
+                                       int(cp.sum(csr.indptr.astype(cp.int64)).get()),
+                                       int(cp.sum(csr.indices.astype(cp.int64)).get()))
+                            except Exception:
+                                key = (A_gpu.shape, int(A_gpu.nnz))
+
+                            cache = self._bj_cache
+                            new_pattern = (not self.bj_cache) or (cache['key'] != key) or (cache['N'] != N)
+                            do_full_rebuild = new_pattern
+                            # Optional periodic full rebuild
+                            if (not do_full_rebuild) and (self.bj_rebuild_every and (cache['build_count'] % self.bj_rebuild_every == 0)):
+                                do_full_rebuild = True
+
+                            if do_full_rebuild:
+                                # Build offsets and full blocks
+                                if self.cg_verbose:
+                                    print(f"[cupy][cg][block_jacobi] full build N={N} nnz={A_gpu.nnz}")
+                                t0 = time.time()
+                                offsets = cp.full((N,3,3), -1, dtype=cp.int64)
+                                blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                                for i_node in range(N):
+                                    base_row = 3 * i_node
+                                    for r in range(3):
+                                        row_idx = base_row + r
+                                        rs = csr.indptr[row_idx]; re = csr.indptr[row_idx + 1]
+                                        cols = csr.indices[rs:re]
+                                        # For each target column position
+                                        for c in range(3):
+                                            col_idx = base_row + c
+                                            pos = cp.where(cols == col_idx)[0]
+                                            if pos.size > 0:
+                                                offsets[i_node, r, c] = rs + pos[0].astype(cp.int64)
+                                # Gather block values using offsets
+                                data_arr = csr.data
                                 for r in range(3):
-                                    row_idx = base_row + r
-                                    row_start = csr.indptr[row_idx]
-                                    row_end = csr.indptr[row_idx + 1]
-                                    cols = csr.indices[row_start:row_end]
-                                    vals = csr.data[row_start:row_end]
-                                    # Gather this node's 3 columns
                                     for c in range(3):
-                                        col_idx = base_row + c
-                                        matches = (cols == col_idx)
-                                        if cp.any(matches):
-                                            blocks[i_node, r, c] = vals[matches][0]
-                                if self.cg_verbose and N > 50 and (i_node % step_nodes == 0 or i_node == N - 1):
-                                    pct = 100.0 * (i_node + 1) / N
-                                    print(f"[cupy][cg][block_jacobi] build {pct:5.1f}% ({i_node+1}/{N})")
+                                        off = offsets[:, r, c]
+                                        mask = off >= 0
+                                        vals = cp.zeros(N, dtype=A_gpu.dtype)
+                                        if mask.any():
+                                            vals[mask] = data_arr[off[mask]]
+                                        blocks[:, r, c] = vals
+                                cache['offsets'] = offsets
+                                cache['key'] = key
+                                cache['N'] = N
+                                cache['build_count'] += 1
+                                if self.cg_verbose:
+                                    print(f"[cupy][cg][block_jacobi] offsets built in {time.time()-t0:.3f}s")
+                            else:
+                                # Reuse offsets and selectively update changed nodes
+                                offsets = cache['offsets']
+                                # If frozen, skip all value updates and reuse existing inv_blocks
+                                if self.bj_freeze_enabled and self._bj_freeze_state.get('frozen', False):
+                                    if self.cg_verbose:
+                                        print("[cupy][cg][block_jacobi] frozen: skipping value update")
+                                    # Ensure inv_blocks exists
+                                    if cache.get('inv_blocks') is None:
+                                        raise RuntimeError("Block-Jacobi frozen without existing inv_blocks; this should not happen.")
+                                    # Short-circuit to matvec creation using existing inv_blocks
+                                    blocks = None  # signal no-recompute
+                                else:
+                                    # Respect update period
+                                    if (self.bj_update_period > 1) and (self._bj_freeze_state.get('step', 0) % self.bj_update_period != 0):
+                                        if self.cg_verbose:
+                                            print(f"[cupy][cg][block_jacobi] skip update (period={self.bj_update_period})")
+                                        blocks = None
+                                    else:
+                                        # Compute changed set and optionally throttle updates
+                                        data_arr = csr.data
+                                        # If theta available, update only changed nodes, else all
+                                        if theta_vec is not None and cache.get('theta_prev') is not None and theta_vec.size == cache['theta_prev'].size:
+                                            dθ = cp.abs(theta_vec - cache['theta_prev'])
+                                            changed = (dθ > self.bj_theta_tol)
+                                        else:
+                                            dθ = None
+                                            changed = cp.ones(N, dtype=cp.bool_)
+                                        # Round-robin partitioning if enabled
+                                        part_mask = cp.ones(N, dtype=cp.bool_)
+                                        if self.bj_partitions and self.bj_partitions > 1:
+                                            step = int(self._bj_freeze_state.get('step', 0))
+                                            part = step % self.bj_partitions
+                                            # Nodes assigned by modulo on index
+                                            idx_all = cp.arange(N)
+                                            part_mask = (idx_all % self.bj_partitions) == part
+                                        candidates = changed & part_mask
+                                        idx = cp.where(candidates)[0]
+                                        if idx.size == 0:
+                                            blocks = None
+                                        else:
+                                            # Throttle update count
+                                            if self.bj_update_fraction < 1.0:
+                                                max_update = int(max(self.bj_min_update, self.bj_update_fraction * N / max(1, self.bj_partitions)))
+                                                if idx.size > max_update:
+                                                    if dθ is not None:
+                                                        # pick top-k by dθ among candidates
+                                                        dθ_cand = dθ[idx]
+                                                        k = max_update
+                                                        # argpartition for top-k indices
+                                                        sel = cp.argpartition(-dθ_cand, k-1)[:k]
+                                                        idx = idx[sel]
+                                                    else:
+                                                        # no dθ available, take first k
+                                                        idx = idx[:max_update]
+                                            # Gather values for selected nodes
+                                            blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                                            for r in range(3):
+                                                for c in range(3):
+                                                    off = offsets[idx, r, c]
+                                                    mask = off >= 0
+                                                    vals = cp.zeros(idx.size, dtype=A_gpu.dtype)
+                                                    if mask.any():
+                                                        vals[mask] = data_arr[off[mask]]
+                                                    blocks[idx, r, c] = vals
+                                    blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                                    data_arr = csr.data
+                                    # If theta available, update only changed nodes, else all
+                                    if theta_vec is not None and cache.get('theta_prev') is not None and theta_vec.size == cache['theta_prev'].size:
+                                        dθ = cp.abs(theta_vec - cache['theta_prev'])
+                                        changed = (dθ > self.bj_theta_tol)
+                                    else:
+                                        changed = cp.ones(N, dtype=cp.bool_)
+                                    # Gather values for changed nodes
+                                    idx = cp.where(changed)[0]
+                                    if idx.size > 0:
+                                        for r in range(3):
+                                            for c in range(3):
+                                                off = offsets[idx, r, c]
+                                                mask = off >= 0
+                                                vals = cp.zeros(idx.size, dtype=A_gpu.dtype)
+                                                if mask.any():
+                                                    vals[mask] = data_arr[off[mask]]
+                                                blocks[idx, r, c] = vals
+                                    # For unchanged nodes, keep previous inv_blocks (no need to fill blocks)
 
-                            a = blocks[:, 0, 0]; b = blocks[:, 0, 1]; c_ = blocks[:, 0, 2]
-                            d = blocks[:, 1, 0]; e = blocks[:, 1, 1]; f = blocks[:, 1, 2]
-                            g = blocks[:, 2, 0]; h = blocks[:, 2, 1]; i_ = blocks[:, 2, 2]
-                            det = (a * (e * i_ - f * h) - b * (d * i_ - f * g) + c_ * (d * h - e * g))
-                            det_safe = cp.where(cp.abs(det) > 1e-12, det, cp.sign(det) * 1e-12)
-                            if self.cg_verbose:
-                                det_abs = cp.abs(det)
-                                det_min = float(det_abs.min().get()) if det_abs.size else 0.0
-                                det_max = float(det_abs.max().get()) if det_abs.size else 0.0
-                                det_mean = float(det_abs.mean().get()) if det_abs.size else 0.0
-                                near = int((det_abs < 1e-12).sum().get())
-                                print(f"[cupy][cg][block_jacobi] det stats |min|={det_min:.3e} |max|={det_max:.3e} |mean|={det_mean:.3e} near_sing={near}")
+                            if blocks is not None:
+                                a = blocks[:, 0, 0]; b = blocks[:, 0, 1]; c_ = blocks[:, 0, 2]
+                                d = blocks[:, 1, 0]; e = blocks[:, 1, 1]; f = blocks[:, 1, 2]
+                                g = blocks[:, 2, 0]; h = blocks[:, 2, 1]; i_ = blocks[:, 2, 2]
+                                det = (a * (e * i_ - f * h) - b * (d * i_ - f * g) + c_ * (d * h - e * g))
+                                det_safe = cp.where(cp.abs(det) > 1e-12, det, cp.sign(det) * 1e-12)
+                                if self.cg_verbose and (do_full_rebuild or (idx.size if 'idx' in locals() else N) == N):
+                                    det_abs = cp.abs(det)
+                                    det_min = float(det_abs.min().get()) if det_abs.size else 0.0
+                                    det_max = float(det_abs.max().get()) if det_abs.size else 0.0
+                                    det_mean = float(det_abs.mean().get()) if det_abs.size else 0.0
+                                    near = int((det_abs < 1e-12).sum().get())
+                                    print(f"[cupy][cg][block_jacobi] det stats |min|={det_min:.3e} |max|={det_max:.3e} |mean|={det_mean:.3e} near_sing={near}")
 
-                            inv_blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
-                            inv_blocks[:, 0, 0] = (e * i_ - f * h) / det_safe
-                            inv_blocks[:, 0, 1] = (c_ * h - b * i_) / det_safe
-                            inv_blocks[:, 0, 2] = (b * f - c_ * e) / det_safe
-                            inv_blocks[:, 1, 0] = (f * g - d * i_) / det_safe
-                            inv_blocks[:, 1, 1] = (a * i_ - c_ * g) / det_safe
-                            inv_blocks[:, 1, 2] = (c_ * d - a * f) / det_safe
-                            inv_blocks[:, 2, 0] = (d * h - e * g) / det_safe
-                            inv_blocks[:, 2, 1] = (b * g - a * h) / det_safe
-                            inv_blocks[:, 2, 2] = (a * e - b * d) / det_safe
+                            # Initialize or update inverse blocks
+                            if blocks is None:
+                                inv_blocks = cache['inv_blocks']
+                            elif do_full_rebuild or cache.get('inv_blocks') is None:
+                                inv_blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
+                                inv_blocks[:, 0, 0] = (e * i_ - f * h) / det_safe
+                                inv_blocks[:, 0, 1] = (c_ * h - b * i_) / det_safe
+                                inv_blocks[:, 0, 2] = (b * f - c_ * e) / det_safe
+                                inv_blocks[:, 1, 0] = (f * g - d * i_) / det_safe
+                                inv_blocks[:, 1, 1] = (a * i_ - c_ * g) / det_safe
+                                inv_blocks[:, 1, 2] = (c_ * d - a * f) / det_safe
+                                inv_blocks[:, 2, 0] = (d * h - e * g) / det_safe
+                                inv_blocks[:, 2, 1] = (b * g - a * h) / det_safe
+                                inv_blocks[:, 2, 2] = (a * e - b * d) / det_safe
+                                cache['inv_blocks'] = inv_blocks
+                            else:
+                                inv_blocks = cache['inv_blocks']
+                                if 'idx' in locals() and idx.size > 0:
+                                    # Recompute only changed rows for idx
+                                    inv_blocks[idx, 0, 0] = (e[idx] * i_[idx] - f[idx] * h[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 0, 1] = (c_[idx] * h[idx] - b[idx] * i_[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 0, 2] = (b[idx] * f[idx] - c_[idx] * e[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 1, 0] = (f[idx] * g[idx] - d[idx] * i_[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 1, 1] = (a[idx] * i_[idx] - c_[idx] * g[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 1, 2] = (c_[idx] * d[idx] - a[idx] * f[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 2, 0] = (d[idx] * h[idx] - e[idx] * g[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 2, 1] = (b[idx] * g[idx] - a[idx] * h[idx]) / det_safe[idx]
+                                    inv_blocks[idx, 2, 2] = (a[idx] * e[idx] - b[idx] * d[idx]) / det_safe[idx]
 
                             def mv(x):
                                 x_mat = x.reshape((N, 3))
                                 res = cp.zeros_like(x_mat)
+                                # Use cached inv_blocks in-place
                                 for rr in range(3):
                                     for cc in range(3):
                                         res[:, rr] += inv_blocks[:, rr, cc] * x_mat[:, cc]
                                 return res.reshape(n_dofs)
 
-                            if self.cg_verbose:
-                                print(f"[cupy][cg][block_jacobi] build done in {time.time()-t0:.3f}s")
-                            return LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                            # Update cached theta only when we recomputed values (full build or partial idx update)
+                            if theta_vec is not None and (do_full_rebuild or (blocks is not None and ('idx' in locals() and idx.size > 0))):
+                                cache['theta_prev'] = theta_vec.copy() if isinstance(theta_vec, cp.ndarray) else cp.asarray(theta_vec)
 
-                        M = create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu)
+                            # Create operator once and reuse; else return existing
+                            if cache.get('operator') is None or do_full_rebuild:
+                                if self.cg_verbose:
+                                    print("[cupy][cg][block_jacobi] operator (re)created")
+                                op = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                                cache['operator'] = op
+                            return cache['operator']
+
+                        theta_vec = None
+                        if θ_current is not None:
+                            try:
+                                theta_vec = cp.asarray(θ_current, dtype=cp.float32).ravel()
+                            except Exception:
+                                theta_vec = None
+                        M = create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu, theta_vec)
                         if self.cg_verbose:
                             print(f"[cupy][cg] block_jacobi (interleaved) built (N={A_gpu.shape[0]//3})")
                 elif self.preconditioner == 'amg':
@@ -499,6 +679,39 @@ class SparseLinearSolver(LinearSolver):
                 if self.cg_verbose:
                     it_disp = self._last_cg_iters if self._last_cg_iters is not None else 'NA'
                     print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it={it_disp} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
+
+                # Auto-freeze/unfreeze policy for block_jacobi value updates
+                if self.preconditioner == 'block_jacobi' and self.bj_freeze_enabled:
+                    st = self._bj_freeze_state
+                    # Track theta stability over time
+                    if θ_current is not None:
+                        try:
+                            θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
+                            cur_mean = float(cp.mean(θ_cur_gpu).get())
+                            if st['prev_mean'] is None:
+                                st['prev_mean'] = cur_mean
+                            dmean = abs(cur_mean - st['prev_mean'])
+                            if dmean <= self.bj_freeze_theta_tol:
+                                st['stable_steps'] = int(st.get('stable_steps', 0)) + 1
+                            else:
+                                st['stable_steps'] = 0
+                            st['prev_mean'] = cur_mean
+                        except Exception:
+                            pass
+                    # Freeze when stable enough and not already frozen
+                    if (not st.get('frozen', False)) and st.get('stable_steps', 0) >= self.bj_freeze_patience:
+                        st['frozen'] = True
+                        st['baseline_iters'] = self._last_cg_iters if isinstance(self._last_cg_iters, int) else st.get('baseline_iters')
+                        if self.cg_verbose:
+                            print(f"[cupy][cg][block_jacobi] auto-freeze: stable_steps={st['stable_steps']} baseline_iters={st['baseline_iters']}")
+                    # Unfreeze if iteration count jumps too much
+                    if st.get('frozen', False) and st.get('baseline_iters') is not None and isinstance(self._last_cg_iters, int):
+                        if self._last_cg_iters > st['baseline_iters'] * self.bj_unfreeze_iter_jump:
+                            st['frozen'] = False
+                            st['stable_steps'] = 0
+                            st['baseline_iters'] = None
+                            if self.cg_verbose:
+                                print(f"[cupy][cg][block_jacobi] auto-unfreeze: iters jumped {self._last_cg_iters} > {self.bj_unfreeze_iter_jump}× baseline")
 
                 return cp.asnumpy(x_gpu)
                 
