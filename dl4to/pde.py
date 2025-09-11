@@ -149,7 +149,11 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'block_jacobi'           # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
+                 preconditioner: str = 'block_jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
+                 amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
+                 amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
+                 amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
+                 amg_min_smooth_steps: int = 1            # Minimum smoothing steps when adapting
                  ):
         # Basic config
         self.use_umfpack = use_umfpack
@@ -172,6 +176,13 @@ class SparseLinearSolver(LinearSolver):
         # AMG cache (CPU pattern reuse)
         self._amg_hierarchy = None
         self._amg_key = None
+        # GPU approximate AMG cached components & parameters
+        self._amg_diag_inv = None
+        self._last_cg_iters = None
+        self.amg_smooth_steps = amg_smooth_steps
+        self.amg_omega = amg_omega
+        self.amg_adaptive = amg_adaptive
+        self.amg_min_smooth_steps = amg_min_smooth_steps
 
         # GPU structural cache
         self._gpu_shape = None
@@ -328,25 +339,63 @@ class SparseLinearSolver(LinearSolver):
                         M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                         if self.cg_verbose:
                             print(f"[cupy][cg] block_jacobi built (N={N})")
+                        # Quick shape sanity check
+                        try:
+                            _test = cp.ones(n_dofs, dtype=A_gpu.dtype)
+                            _out = M.matvec(_test)
+                            if _out.shape[0] != n_dofs:
+                                raise RuntimeError("block_jacobi matvec shape mismatch")
+                        except Exception as e:
+                            if self.cg_verbose:
+                                print(f"[cupy][cg] block_jacobi invalid ({e}); falling back to scalar jacobi")
+                            diag = A_gpu.diagonal()
+                            inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                            def mv(x):
+                                return inv_diag * x
+                            M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                 elif self.preconditioner == 'amg':
-                    # Approximate AMG: k steps of damped Jacobi as an explicit approximate inverse apply.
-                    diag = A_gpu.diagonal()
-                    inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
-                    ω = 0.8
-                    k_smooth = 4  # number of smoothing (inverse approximation) iterations
+                    # Lightweight approximate AMG: repeated damped Jacobi smoothing as inverse apply.
+                    # Reuse diagonal inverse if sparsity pattern unchanged.
+                    pattern_key = (A_gpu.shape, A_gpu.nnz)
+                    if self._amg_diag_inv is None or self._amg_key != pattern_key:
+                        diag = A_gpu.diagonal()
+                        self._amg_diag_inv = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        self._amg_key = pattern_key
+                    inv_diag = self._amg_diag_inv
+                    base_k = self.amg_smooth_steps
+                    k_eff = base_k
+                    if self.amg_adaptive and self._last_cg_iters is not None and self.cg_max_iter is not None:
+                        frac = self._last_cg_iters / max(1, self.cg_max_iter)
+                        # Reduce smoothing if CG already fast
+                        if frac < 0.25:
+                            k_eff = max(self.amg_min_smooth_steps, base_k - 1)
+                        if frac < 0.10:
+                            k_eff = max(self.amg_min_smooth_steps, base_k - 2)
+                    ω = self.amg_omega
                     def mv(x):
-                        # Solve approximately A y = x using k Jacobi iterations starting y=0.
-                        y = cp.zeros_like(x)
-                        for _ in range(k_smooth):
+                        # Approx solve A y = x starting y=x * diag^{-1} initial guess for quicker convergence.
+                        y = inv_diag * x
+                        for _ in range(k_eff - 1):  # already one implicit pre-smooth in init
                             r_loc = x - A_gpu @ y
                             y = y + ω * inv_diag * r_loc
                         return y
                     M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                     if self.cg_verbose:
-                        print(f"[cupy][cg] amg approx inverse: k={k_smooth} ω={ω}")
+                        print(f"[cupy][cg] amg approx inverse: k={k_eff} (base={base_k}) ω={ω} last_it={self._last_cg_iters}")
 
                 # (3) RHS & warm start
                 b_gpu = cp.asarray(b)
+
+                # Dimension sanity check before proceeding
+                n_rows = A_gpu.shape[0]
+                if b_gpu.ndim > 1:
+                    b_gpu = b_gpu.ravel()
+                if b_gpu.size != n_rows:
+                    # Provide detailed diagnostics and a helpful hint
+                    msg = (f"[cupy][cg] Dimension mismatch: A rows={n_rows}, b size={b_gpu.size}. "
+                           f"This typically means the load tensor F had unexpected channel count (e.g. 9 instead of 3). "
+                           f"Ensure problem.F shape is (3, Nx, Ny, Nz). If it's (9, ...), select only the displacement DOF loads before solving.")
+                    raise ValueError(msg)
 
                 cache = self._warm_cache.get(phase, {'x': None, 'b': None, 'θ': None})
 
@@ -412,7 +461,28 @@ class SparseLinearSolver(LinearSolver):
                 #     max_iter = int(min(10000, max(1000, 2 * int(cp.sqrt(n)))))
 
                 start_time = time.time()
-                x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M)
+                # Count iterations via callback (cupyx mirrors scipy interface)
+                it_counter = {'k': 0}
+                def _cb(_):
+                    it_counter['k'] += 1
+                try:
+                    x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
+                except ValueError as ve:
+                    # Auto-fallback if block_jacobi caused dimensional issue
+                    if self.preconditioner == 'block_jacobi' and 'incompatible dimensions' in str(ve).lower():
+                        if self.cg_verbose:
+                            print("[cupy][cg] fallback: block_jacobi caused dimension error; retrying with scalar jacobi")
+                        diag = A_gpu.diagonal()
+                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        def mv(x):
+                            return inv_diag * x
+                        M_fallback = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                        it_counter = {'k': 0}
+                        def _cb_fb(_):
+                            it_counter['k'] += 1
+                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=None, tol=self.cg_tol, maxiter=max_iter, M=M_fallback, callback=_cb_fb)
+                    else:
+                        raise
                 cp.cuda.get_current_stream().synchronize()
                 elapsed = time.time() - start_time
 
@@ -431,8 +501,11 @@ class SparseLinearSolver(LinearSolver):
                             cache['θ'] = cache.get('θ')  # keep old if failure
                     self._warm_cache[phase] = cache
 
+                # Store last iterations (info==0 -> success) using counter if available
+                self._last_cg_iters = it_counter['k'] if it_counter['k'] > 0 else (info if isinstance(info, int) and info > 0 else None)
                 if self.cg_verbose:
-                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it<={max_iter} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
+                    it_disp = self._last_cg_iters if self._last_cg_iters is not None else 'NA'
+                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it={it_disp} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
 
                 return cp.asnumpy(x_gpu)
                 
