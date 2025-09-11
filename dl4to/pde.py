@@ -147,7 +147,7 @@ class SparseLinearSolver(LinearSolver):
                  cg_verbose: bool = True,
                  warm_start: bool = True,
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
-                 warm_theta_tol: float = 5e-3,            # Relative L2 change tolerance on θ for warm reuse
+                 warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta'             # 'theta' | 'rhs' | 'both'
                  ):
         # Basic config
@@ -251,18 +251,19 @@ class SparseLinearSolver(LinearSolver):
                     allow_theta = True
                     allow_rhs = True
 
-                    # (a) θ-based gating
+                    # (a) θ-based gating (mean density change)
                     if self.warm_strategy in ['theta', 'both'] and θ_current is not None and cache.get('θ') is not None:
                         try:
                             θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
                             θ_prev_gpu = cache['θ']
                             # Ensure shapes match
                             if θ_prev_gpu.shape == θ_cur_gpu.shape:
-                                diff = θ_cur_gpu - θ_prev_gpu
-                                rel = cp.linalg.norm(diff) / (cp.linalg.norm(θ_prev_gpu) + 1e-12)
-                                allow_theta = (rel <= self.warm_theta_tol)
+                                mean_prev = cp.mean(θ_prev_gpu)
+                                mean_cur = cp.mean(θ_cur_gpu)
+                                abs_mean_diff = float(cp.abs(mean_cur - mean_prev))
+                                allow_theta = (abs_mean_diff <= self.warm_theta_tol)
                                 if self.cg_verbose:
-                                    print(f"[cupy][cg] θ rel_change={float(rel):.3e} tol={self.warm_theta_tol:.1e} allow={allow_theta}")
+                                    print(f"[cupy][cg] θ mean_change={abs_mean_diff:.3e} tol={self.warm_theta_tol:.1e} allow={allow_theta}")
                             else:
                                 allow_theta = False
                         except Exception as e:
@@ -784,7 +785,7 @@ class UnpaddedFDM(PDESolver):
             factorize=False,
             use_cupy=True,
             warm_strategy='theta',
-            warm_theta_tol=5e-3
+            warm_theta_tol=1e-2
         )
         self.use_forward_differences = use_forward_differences
         self.assemble_tensors_when_passed_to_problem = assemble_tensors_when_passed_to_problem
