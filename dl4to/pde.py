@@ -55,8 +55,12 @@ class AutogradLinearSolver(torch.autograd.Function):
             solver = factorized(A_mat)
             x = solver(np_b)
         else:
-            # pass phase explicitly
-            x = solver(A_mat, np_b, phase=phase)
+            # pass phase explicitly and include θ for warm-start gating if solver supports it
+            try:
+                x = solver(A_mat, np_b, phase=phase, θ_current=θ.detach().cpu().numpy())
+            except TypeError:
+                # Backward compatibility if older signature
+                x = solver(A_mat, np_b, phase=phase)
 
         x = torch.from_numpy(x.astype(np_b.dtype))
         ctx.save_for_backward(θ, x, b)
@@ -88,7 +92,10 @@ class AutogradLinearSolver(torch.autograd.Function):
             if factorize:
                 y = solver(flat_np_grad_output)
             else:
-                y = solver(A_mat, flat_np_grad_output, phase=phase)
+                try:
+                    y = solver(A_mat, flat_np_grad_output, phase=phase, θ_current=θ.detach().cpu().numpy())
+                except TypeError:
+                    y = solver(A_mat, flat_np_grad_output, phase=phase)
 
             y = torch.from_numpy(y).clone().requires_grad_(False)
             x = x.clone().requires_grad_(False)
@@ -139,7 +146,9 @@ class SparseLinearSolver(LinearSolver):
                  cg_max_iter: int = None,
                  cg_verbose: bool = False,
                  warm_start: bool = True,
-                 warm_similarity_threshold: float = 0.9  # Stricter for phase separation safety
+                 warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
+                 warm_theta_tol: float = 5e-3,            # Relative L2 change tolerance on θ for warm reuse
+                 warm_strategy: str = 'theta'             # 'theta' | 'rhs' | 'both'
                  ):
         # Basic config
         self.use_umfpack = use_umfpack
@@ -151,6 +160,10 @@ class SparseLinearSolver(LinearSolver):
         self.cg_verbose = cg_verbose
         self.warm_start = warm_start
         self.warm_similarity_threshold = warm_similarity_threshold
+        self.warm_theta_tol = warm_theta_tol
+        self.warm_strategy = warm_strategy.lower()
+        if self.warm_strategy not in ['theta', 'rhs', 'both']:
+            raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
 
         # GPU structural cache
         self._gpu_shape = None
@@ -159,8 +172,8 @@ class SparseLinearSolver(LinearSolver):
 
         # Phase separated warm caches: {'forward': {'x': cp.array, 'b': cp.array}, 'adjoint': {...}}
         self._warm_cache = {
-            'forward': {'x': None, 'b': None},
-            'adjoint': {'x': None, 'b': None}
+            'forward': {'x': None, 'b': None, 'θ': None},
+            'adjoint': {'x': None, 'b': None, 'θ': None}
         }
 
         # Cupy availability
@@ -201,13 +214,22 @@ class SparseLinearSolver(LinearSolver):
     def _solver(self):
         if self.have_cupy:
             # GPU solver
-            def solve_gpu(A, b, phase='forward'):
+            def solve_gpu(A, b, phase='forward', θ_current=None):
                 # (1) Upload / reuse sparsity pattern
                 # Reuse indices/indptr if shape unchanged to avoid repeated allocations
                 if (self._gpu_shape != A.shape) or (self._gpu_indices is None) or (self._gpu_indptr is None):
-                    self._gpu_shape = A.shape
-                    self._gpu_indices = cp.asarray(A.indices)
-                    self._gpu_indptr = cp.asarray(A.indptr)
+                    # Rebuild sparsity pattern if:
+                    # - shape changed
+                    # - first time (_gpu_indices/_gpu_indptr None)
+                    # - nnz changed (e.g. different Dirichlet mask or structural modification)
+                    if (self._gpu_shape != A.shape) or \
+                       (self._gpu_indices is None) or \
+                       (self._gpu_indptr is None) or \
+                       (getattr(self, "_gpu_nnz", None) != A.nnz):
+                        self._gpu_shape = A.shape
+                        self._gpu_indices = cp.asarray(A.indices)
+                        self._gpu_indptr = cp.asarray(A.indptr)
+                        self._gpu_nnz = A.nnz
                 # Always upload fresh numeric values (data changes each call)
                 data_gpu = cp.asarray(A.data)
                 A_gpu = cp_csc_matrix((data_gpu, self._gpu_indices, self._gpu_indptr), shape=A.shape)
@@ -222,24 +244,60 @@ class SparseLinearSolver(LinearSolver):
                 # (3) RHS & warm start
                 b_gpu = cp.asarray(b)
 
-                cache = self._warm_cache.get(phase, {'x': None, 'b': None})
+                cache = self._warm_cache.get(phase, {'x': None, 'b': None, 'θ': None})
 
                 x0 = None
                 if self.warm_start and cache['x'] is not None and cache['x'].shape[0] == b_gpu.shape[0]:
-                    if cache['b'] is not None:
+                    allow_theta = True
+                    allow_rhs = True
+
+                    # (a) θ-based gating
+                    if self.warm_strategy in ['theta', 'both'] and θ_current is not None and cache.get('θ') is not None:
+                        try:
+                            θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
+                            θ_prev_gpu = cache['θ']
+                            # Ensure shapes match
+                            if θ_prev_gpu.shape == θ_cur_gpu.shape:
+                                diff = θ_cur_gpu - θ_prev_gpu
+                                rel = cp.linalg.norm(diff) / (cp.linalg.norm(θ_prev_gpu) + 1e-12)
+                                allow_theta = (rel <= self.warm_theta_tol)
+                                if self.cg_verbose:
+                                    print(f"[cupy][cg] θ rel_change={float(rel):.3e} tol={self.warm_theta_tol:.1e} allow={allow_theta}")
+                            else:
+                                allow_theta = False
+                        except Exception as e:
+                            allow_theta = False
+                            if self.cg_verbose:
+                                print(f"[cupy][cg] θ gating error: {e}; skipping warm start")
+
+                    # (b) RHS cosine gating (legacy / mostly relevant if b changes)
+                    if self.warm_strategy in ['rhs', 'both'] and cache.get('b') is not None:
                         bn = cp.linalg.norm(b_gpu)
                         bln = cp.linalg.norm(cache['b'])
                         if bn > 0 and bln > 0:
                             cos_sim = float(cp.dot(b_gpu, cache['b']) / (bn * bln))
-                            if cos_sim >= self.warm_similarity_threshold:
-                                x0 = cache['x']
-                            elif self.cg_verbose:
-                                print(f"[cupy][cg] warm skip phase={phase} cos={cos_sim:.3f} < {self.warm_similarity_threshold}")
+                            allow_rhs = (cos_sim >= self.warm_similarity_threshold)
+                            if self.cg_verbose:
+                                print(f"[cupy][cg] b cos={cos_sim:.3f} thr={self.warm_similarity_threshold} allow={allow_rhs}")
                         else:
-                            # Zero RHS edge case; allow reuse (will converge fast anyway)
-                            x0 = cache['x']
-                    else:
+                            allow_rhs = True  # zero vector; reuse fine
+                    
+                    # Combine
+                    use_warm = False
+                    if self.warm_strategy == 'theta':
+                        use_warm = allow_theta
+                    elif self.warm_strategy == 'rhs':
+                        use_warm = allow_rhs
+                    else:  # both
+                        use_warm = allow_theta and allow_rhs
+
+                    if use_warm:
                         x0 = cache['x']
+                        if self.cg_verbose:
+                            print(f"[cupy][cg] warm reuse phase={phase} strategy={self.warm_strategy}")
+                    else:
+                        if self.cg_verbose:
+                            print(f"[cupy][cg] warm skip phase={phase} strategy={self.warm_strategy}")
 
                 
                 max_iter = self.cg_max_iter
@@ -259,9 +317,13 @@ class SparseLinearSolver(LinearSolver):
 
                 # Cache warm start
                 if self.warm_start:
-                    # Update phase cache
                     cache['x'] = x_gpu
-                    cache['b'] = b_gpu
+                    cache['b'] = b_gpu if self.warm_strategy in ['rhs', 'both'] else cache.get('b')
+                    if θ_current is not None and self.warm_strategy in ['theta', 'both']:
+                        try:
+                            cache['θ'] = cp.asarray(θ_current, dtype=cp.float32)
+                        except Exception:
+                            cache['θ'] = cache.get('θ')  # keep old if failure
                     self._warm_cache[phase] = cache
 
                 if self.cg_verbose:
@@ -270,8 +332,8 @@ class SparseLinearSolver(LinearSolver):
                 return cp.asnumpy(x_gpu)
                 
             return solve_gpu
-        # CPU solver (ignore phase)
-        return lambda A, b, phase='forward': spsolve(A, b, use_umfpack=self.use_umfpack)
+        # CPU solver (ignore phase) - accept θ_current for interface consistency
+        return lambda A, b, phase='forward', θ_current=None: spsolve(A, b, use_umfpack=self.use_umfpack)
 
 # Internal Cell
 import copy
@@ -716,7 +778,14 @@ class UnpaddedFDM(PDESolver):
                  assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
                  ):
         self._θ_min = θ_min
-        self._linear_solver = SparseLinearSolver(use_umfpack=True, factorize=True)
+        # Use iterative solver (factorize=False) to allow θ-based warm-start gating & GPU path
+        self._linear_solver = SparseLinearSolver(
+            use_umfpack=True,
+            factorize=False,
+            use_cupy=True,
+            warm_strategy='theta',
+            warm_theta_tol=5e-3
+        )
         self.use_forward_differences = use_forward_differences
         self.assemble_tensors_when_passed_to_problem = assemble_tensors_when_passed_to_problem
         self.assembled_tensors = False
