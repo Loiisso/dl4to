@@ -170,8 +170,8 @@ class SparseLinearSolver(LinearSolver):
         if self.warm_strategy not in ['theta', 'rhs', 'both']:
             raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
         self.preconditioner = preconditioner.lower()
-        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg']:
-            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', or 'amg'")
+        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu']:
+            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', 'amg', 'lu', or 'splu'")
 
         # AMG cache (CPU pattern reuse)
         self._amg_hierarchy = None
@@ -271,6 +271,132 @@ class SparseLinearSolver(LinearSolver):
     #     return amg_solver
 
     def _solver(self):
+        # --- PyAMGX GPU solver integration ---
+        try:
+            import pyamgx
+            self.have_pyamgx = True
+        except ImportError:
+            self.have_pyamgx = False
+
+        if self.have_pyamgx and self.preconditioner == 'amgx':
+            # PyAMGX config (can be made user-configurable)
+            def default_amgx_config(tol):
+                return {
+                    "config_version": 2,
+                    "determinism_flag": 1,
+                    "solver": {
+                        "preconditioner": {
+                            "print_grid_stats": 1,
+                            "algorithm": "AGGREGATION",
+                            "print_vis_data": 0,
+                            "solver": "AMG",
+                            "smoother": {
+                                "relaxation_factor": 0.8,
+                                "scope": "jacobi",
+                                "solver": "PCG",
+                                "monitor_residual": 0,
+                                "print_solve_stats": 0
+                            },
+                            "print_solve_stats": 0,
+                            "presweeps": 0,
+                            "interpolator": "D2",
+                            "selector": "SIZE_2",
+                            "coarse_solver": "NOSOLVER",
+                            "max_iters": 1,
+                            "monitor_residual": 0,
+                            "store_res_history": 0,
+                            "scope": "amg",
+                            "max_levels": 50,
+                            "postsweeps": 3,
+                            "cycle": "V"
+                        },
+                        "solver": "PCG",
+                        "print_solve_stats": 1,
+                        "obtain_timings": 1,
+                        "max_iters": 100,
+                        "monitor_residual": 1,
+                        "convergence": "RELATIVE_INI",
+                        "scope": "main",
+                        "tolerance": 1e-6,
+                        "norm": "L2"
+                    }
+                }
+
+            # Cache AMGX objects for constant sparsity pattern
+            if not hasattr(self, '_amgx_cache'):
+                self._amgx_cache = {
+                    'shape': None,
+                    'nnz': None,
+                    'Am': None,
+                    'solver': None,
+                    'rsrc': None,
+                    'cfg_obj': None
+                }
+
+            def solve_gpu_amgx(A, b, phase='forward', θ_current=None):
+                import numpy as np
+                import time
+                # Only support float64
+                if A.dtype != np.float64:
+                    A = A.astype(np.float64)
+                n = A.shape[0]
+                # Init AMGX if needed
+                pyamgx.initialize()
+                cache = self._amgx_cache
+                pattern_changed = (cache['shape'] != A.shape) or (cache['nnz'] != A.nnz)
+                if pattern_changed or cache['Am'] is None:
+                    # Clean up old objects
+                    for k in ['solver','Am','rsrc','cfg_obj']:
+                        if cache.get(k) is not None:
+                            try:
+                                cache[k].destroy()
+                            except Exception:
+                                pass
+                            cache[k] = None
+                    # Create new config/resources/solver/matrix
+                    cfg_dict = default_amgx_config(self.cg_tol)
+                    cache['cfg_obj'] = pyamgx.Config().create_from_dict(cfg_dict)
+                    cache['rsrc'] = pyamgx.Resources().create_simple(cache['cfg_obj'])
+                    cache['solver'] = pyamgx.Solver().create(cache['rsrc'], cache['cfg_obj'])
+                    cache['Am'] = pyamgx.Matrix().create(cache['rsrc'])
+                    cache['shape'] = A.shape
+                    cache['nnz'] = A.nnz
+                    # Upload pattern and values
+                    try:
+                        cache['Am'].upload_CSR(A.tocsr())
+                    except TypeError:
+                        indptr_i32 = A.indptr.astype(np.int32, copy=False)
+                        indices_i32 = A.indices.astype(np.int32, copy=False)
+                        data_cast = A.data
+                        try:
+                            cache['Am'].upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
+                        except TypeError:
+                            cache['Am'].upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
+                    cache['solver'].setup(cache['Am'])
+                else:
+                    # Only upload new values if pattern is the same
+                    try:
+                        cache['Am'].upload_CSR(A.tocsr())
+                    except TypeError:
+                        indptr_i32 = A.indptr.astype(np.int32, copy=False)
+                        indices_i32 = A.indices.astype(np.int32, copy=False)
+                        data_cast = A.data
+                        try:
+                            cache['Am'].upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
+                        except TypeError:
+                            cache['Am'].upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
+                # Upload vectors
+                xb = pyamgx.Vector().create(cache['rsrc'])
+                bb = pyamgx.Vector().create(cache['rsrc'])
+                xb.upload(np.zeros(n, dtype=np.float64))
+                bb.upload(b.astype(np.float64))
+                # Solve
+                cache['solver'].solve(bb, xb)
+                x = xb.download()
+                xb.destroy(); bb.destroy()
+                return x
+            return solve_gpu_amgx
+
         if self.have_cupy:
             # GPU solver
             def solve_gpu(A, b, phase='forward', θ_current=None):
@@ -293,7 +419,22 @@ class SparseLinearSolver(LinearSolver):
                 data_gpu = cp.asarray(A.data)
                 A_gpu = cp_csc_matrix((data_gpu, self._gpu_indices, self._gpu_indptr), shape=A.shape)
 
-                # (2) Build / select preconditioner
+                # Direct GPU sparse solve if requested (uses cupyx.scipy.sparse.linalg.spsolve)
+                if self.preconditioner in ['lu', 'splu']:
+                    
+                    from scipy.sparse.linalg import splu as scipy_splu
+                    def solve_gpu_direct(A, b, phase='forward', θ_current=None):
+                        start_time = time.time()
+                        if "lu" not in self.cache:
+                            # we do it once
+                            self.cache['lu'] = scipy_splu(A_gpu.tocsc())
+                        x = self.cache['lu'](A, b)
+                        if self.cg_verbose:
+                            print(f"[cpu][{"splu"}] phase={phase} n={A.shape[0]} time={time.time()-start_time:.3f}s")
+                        return x
+                    return solve_gpu_direct
+
+                # (2) Build / select preconditioner for CG
                 M = None
                 if self.preconditioner == 'none':
                     M = None
@@ -638,6 +779,9 @@ class SparseLinearSolver(LinearSolver):
                 it_counter = {'k': 0}
                 def _cb(_):
                     it_counter['k'] += 1
+
+                lu = cupy.sparse.linalg.splu(A_gpu)
+                
                 try:
                     x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
                 except ValueError as ve:
@@ -717,6 +861,21 @@ class SparseLinearSolver(LinearSolver):
                 
             return solve_gpu
         # CPU solver (iterative / direct depending on config)
+        if self.preconditioner in ['lu', 'splu']:
+            # Direct CPU sparse solve; use SuperLU explicitly for 'splu'
+            from scipy.sparse.linalg import splu as scipy_splu
+            def solve_cpu_direct(A, b, phase='forward', θ_current=None):
+                start_time = time.time()
+                if self.preconditioner == 'splu':
+                    x = scipy_splu(A.tocsc()).solve(b)
+                    method = 'splu'
+                else:
+                    x = spsolve(A, b, use_umfpack=self.use_umfpack)
+                    method = 'spsolve'
+                if self.cg_verbose:
+                    print(f"[cpu][{method}] phase={phase} n={A.shape[0]} time={time.time()-start_time:.3f}s")
+                return x
+            return solve_cpu_direct
         if self.preconditioner == 'amg':
             def solve_cpu_amg(A, b, phase='forward', θ_current=None):
                 # Key by shape + nnz; if nnz unchanged assume pattern stable
