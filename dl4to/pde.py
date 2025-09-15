@@ -141,7 +141,8 @@ class SparseLinearSolver(LinearSolver):
     def __init__(self,
                  use_umfpack: bool = True,
                  factorize: bool = False,
-                 use_cupy: bool = True,
+                 use_amgx: bool = True,
+                 use_cupy: bool = False,
                  cg_tol: float = 1e-6,
                  cg_max_iter: int = None,
                  cg_verbose: bool = True,
@@ -149,7 +150,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'block_jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg'
+                 preconditioner: str = 'amgx',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -158,6 +159,7 @@ class SparseLinearSolver(LinearSolver):
         # Basic config
         self.use_umfpack = use_umfpack
         self.use_cupy_requested = use_cupy
+        self.use_amgx_requested = use_amgx
         self.have_cupy = False
         self.backend = "scipy"
         self.cg_tol = cg_tol
@@ -170,7 +172,7 @@ class SparseLinearSolver(LinearSolver):
         if self.warm_strategy not in ['theta', 'rhs', 'both']:
             raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
         self.preconditioner = preconditioner.lower()
-        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu']:
+        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', "amgx"]:
             raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', 'amg', 'lu', or 'splu'")
 
         # AMG cache (CPU pattern reuse)
@@ -225,6 +227,16 @@ class SparseLinearSolver(LinearSolver):
             'forward': {'x': None, 'b': None, 'θ': None},
             'adjoint': {'x': None, 'b': None, 'θ': None}
         }
+        # AGMX availability
+        if self.use_amgx_requested:
+            try:
+                import pyamgx  # noqa: F401
+                self.have_pyamgx = True
+                if self.cg_verbose:
+                    print("[amgx] PyAMGX GPU solver enabled.")
+            except ImportError:
+                self.have_pyamgx = False
+                warnings.warn("pyamgx not installed; falling back to scipy/cupy backend.")
 
         # Cupy availability
         if use_cupy:
