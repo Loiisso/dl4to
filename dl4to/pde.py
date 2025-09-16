@@ -141,8 +141,8 @@ class SparseLinearSolver(LinearSolver):
     def __init__(self,
                  use_umfpack: bool = True,
                  factorize: bool = False,
-                 use_amgx: bool = True,
-                 use_cupy: bool = False,
+                 use_amgx: bool = False,
+                 use_cupy: bool = True,
                  cg_tol: float = 1e-6,
                  cg_max_iter: int = None,
                  cg_verbose: bool = True,
@@ -150,7 +150,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'amgx',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx'
+                 preconditioner: str = 'jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -345,74 +345,94 @@ class SparseLinearSolver(LinearSolver):
                     'cfg_obj': None
                 }
 
+            # --- PyAMGX global init/finalize guard ---
+            import threading
+            _amgx_global_lock = threading.Lock()
+            if not hasattr(pyamgx, '_dl4to_initialized'):
+                pyamgx._dl4to_initialized = False
+
+            def amgx_global_init():
+                with _amgx_global_lock:
+                    if not pyamgx._dl4to_initialized:
+                        pyamgx.initialize()
+                        pyamgx._dl4to_initialized = True
+
             def solve_gpu_amgx(A, b, phase='forward', θ_current=None):
                 import numpy as np
                 import time
+                amgx_global_init()
                 # Only support float64
                 if A.dtype != np.float64:
                     A = A.astype(np.float64)
                 n = A.shape[0]
-                # Init AMGX if needed
-                pyamgx.initialize()
-                cache = self._amgx_cache
-                pattern_changed = (cache['shape'] != A.shape) or (cache['nnz'] != A.nnz)
-                if pattern_changed or cache['Am'] is None:
-                    # Clean up old objects
-                    for k in ['solver','Am','rsrc','cfg_obj']:
-                        if cache.get(k) is not None:
-                            try:
-                                cache[k].destroy()
-                            except Exception:
-                                pass
-                            cache[k] = None
-                    # Create new config/resources/solver/matrix
-                    cfg_dict = default_amgx_config(self.cg_tol)
-                    cache['cfg_obj'] = pyamgx.Config().create_from_dict(cfg_dict)
-                    cache['rsrc'] = pyamgx.Resources().create_simple(cache['cfg_obj'])
-                    cache['solver'] = pyamgx.Solver().create(cache['rsrc'], cache['cfg_obj'])
-                    cache['Am'] = pyamgx.Matrix().create(cache['rsrc'])
-                    cache['shape'] = A.shape
-                    cache['nnz'] = A.nnz
-                    # Upload pattern and values
-                    try:
-                        cache['Am'].upload_CSR(A.tocsr())
-                    except TypeError:
-                        indptr_i32 = A.indptr.astype(np.int32, copy=False)
-                        indices_i32 = A.indices.astype(np.int32, copy=False)
-                        data_cast = A.data
-                        try:
-                            cache['Am'].upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
-                        except TypeError:
-                            cache['Am'].upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
-                    cache['solver'].setup(cache['Am'])
+                # --- Matrix diagnostics ---
+                diag = A.diagonal()
+                print(f"[AMGX] Matrix shape: {A.shape}, nnz: {A.nnz}")
+                print(f"[AMGX] Diagonal: min={diag.min():.3e}, max={diag.max():.3e}, mean={diag.mean():.3e}")
+                # Check for positive semi-definiteness (all diag >= 0)
+                neg_diag = np.sum(diag < -1e-12)
+                if neg_diag > 0:
+                    print(f"[AMGX][WARNING] Matrix diagonal has {neg_diag} negative entries! Matrix may not be positive semi-definite.")
+                # Check for NaNs or infs
+                nan_count = np.sum(np.isnan(diag))
+                inf_count = np.sum(np.isinf(diag))
+                if nan_count > 0 or inf_count > 0:
+                    print(f"[AMGX][ERROR] Matrix diagonal contains {nan_count} NaN and {inf_count} Inf!")
+                # Check condition number estimate
+                if diag.min() > 0:
+                    cond_est = diag.max() / diag.min()
+                    print(f"[AMGX] Diagonal condition number estimate: {cond_est:.2e}")
                 else:
-                    # Only upload new values if pattern is the same
+                    print("[AMGX][WARNING] Zero or negative diagonal entries prevent condition number estimate")
+                # Always create new AMGX objects, no caching
+                cfg_dict = default_amgx_config(self.cg_tol)
+                cfg_obj = pyamgx.Config().create_from_dict(cfg_dict)
+                rsrc = pyamgx.Resources().create_simple(cfg_obj)
+                solver = pyamgx.Solver().create(rsrc, cfg_obj)
+                mode = "dDDI"
+                Am = pyamgx.Matrix().create(rsrc, mode)
+                try:
+                    Am.upload_CSR(A.tocsr())
+                except TypeError:
+                    indptr_i32 = A.indptr.astype(np.int32, copy=False)
+                    indices_i32 = A.indices.astype(np.int32, copy=False)
+                    data_cast = A.data
                     try:
-                        cache['Am'].upload_CSR(A.tocsr())
+                        Am.upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
                     except TypeError:
-                        indptr_i32 = A.indptr.astype(np.int32, copy=False)
-                        indices_i32 = A.indices.astype(np.int32, copy=False)
-                        data_cast = A.data
-                        try:
-                            cache['Am'].upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
-                        except TypeError:
-                            cache['Am'].upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
-                # Upload vectors
-                xb = pyamgx.Vector().create(cache['rsrc'])
-                bb = pyamgx.Vector().create(cache['rsrc'])
+                        Am.upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
+                solver.setup(Am)
+                xb = pyamgx.Vector().create(rsrc, mode)
+                bb = pyamgx.Vector().create(rsrc, mode)
                 xb.upload(np.zeros(n, dtype=np.float64))
                 bb.upload(b.astype(np.float64))
-                # Solve
-                cache['solver'].solve(bb, xb)
+                solver.solve(bb, xb)
                 x = xb.download()
-                xb.destroy(); bb.destroy()
+                xb.destroy(); bb.destroy(); Am.destroy(); solver.destroy(); rsrc.destroy(); cfg_obj.destroy()
                 return x
             return solve_gpu_amgx
 
         if self.have_cupy:
             # GPU solver
             def solve_gpu(A, b, phase='forward', θ_current=None):
-                # (1) Upload / reuse sparsity pattern
+                import numpy as np
+                import cupy as cp
+                # Matrix diagnostics (similar to AMGX)
+                diag = A.diagonal()
+                print(f"[CuPy] Matrix shape: {A.shape}, nnz: {A.nnz}")
+                print(f"[CuPy] Diagonal: min={diag.min():.3e}, max={diag.max():.3e}, mean={diag.mean():.3e}")
+                neg_diag = np.sum(diag < -1e-12)
+                if neg_diag > 0:
+                    print(f"[CuPy][WARNING] Matrix diagonal has {neg_diag} negative entries! Matrix may not be positive semi-definite.")
+                nan_count = np.sum(np.isnan(diag))
+                inf_count = np.sum(np.isinf(diag))
+                if nan_count > 0 or inf_count > 0:
+                    print(f"[CuPy][ERROR] Matrix diagonal contains {nan_count} NaN and {inf_count} Inf!")
+                if diag.min() > 0:
+                    cond_est = diag.max() / diag.min()
+                    print(f"[CuPy] Diagonal condition number estimate: {cond_est:.2e}")
+                else:
+                    print("[CuPy][WARNING] Zero or negative diagonal entries prevent condition number estimate")
                 # Reuse indices/indptr if shape unchanged to avoid repeated allocations
                 if (self._gpu_shape != A.shape) or (self._gpu_indices is None) or (self._gpu_indptr is None):
                     # Rebuild sparsity pattern if:
@@ -792,7 +812,7 @@ class SparseLinearSolver(LinearSolver):
                 def _cb(_):
                     it_counter['k'] += 1
 
-                lu = cupy.sparse.linalg.splu(A_gpu)
+                # lu = cupy.sparse.linalg.splu(A_gpu)
                 
                 try:
                     x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
