@@ -33,6 +33,16 @@ try:
 except ImportError:
     print("cupy is imported/used only if availabe ")
     cp = None
+
+# Legate-sparse import
+have_legate_sparse = False
+try:
+    import legate_sparse as ls
+    from legate_sparse.linalg import cg as ls_cg, LinearOperator as ls_LinearOperator
+    import cupynumeric as cn
+    have_legate_sparse = True
+except ImportError:
+    ls = None
     
 # Cell
 class AutogradLinearSolver(torch.autograd.Function):
@@ -150,7 +160,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx'
+                 preconditioner: str = 'jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx' | 'legat'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -172,8 +182,8 @@ class SparseLinearSolver(LinearSolver):
         if self.warm_strategy not in ['theta', 'rhs', 'both']:
             raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
         self.preconditioner = preconditioner.lower()
-        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', "amgx"]:
-            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', 'amg', 'lu', or 'splu'")
+        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', "amgx", "legat"]:
+            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', 'amgx', or 'legat'")
 
         # AMG cache (CPU pattern reuse)
         self._amg_hierarchy = None
@@ -266,6 +276,12 @@ class SparseLinearSolver(LinearSolver):
 
         if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
             warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
+
+        # Legate-sparse availability
+        self.have_legate_sparse = have_legate_sparse
+        if self.use_cupy_requested and self.have_legate_sparse:
+            if self.cg_verbose:
+                print("[legate-sparse] GPU solver enabled.")
 
         super().__init__(factorize)
 
@@ -728,6 +744,25 @@ class SparseLinearSolver(LinearSolver):
                     M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                     if self.cg_verbose:
                         print(f"[cupy][cg] amg approx inverse: k={k_eff} (base={base_k}) ω={ω} last_it={self._last_cg_iters}")
+                elif self.preconditioner == 'legat':
+                    if self.have_legate_sparse:
+                        # Use legate-sparse Jacobi preconditioner
+                        diag = A_gpu.diagonal()
+                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        def mv(x):
+                            return inv_diag * x
+                        M = ls_LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                        if self.cg_verbose:
+                            print(f"[cupy][cg] legate-sparse jacobi preconditioner")
+                    else:
+                        # Fallback to cupy jacobi
+                        diag = A_gpu.diagonal()
+                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        def mv(x):
+                            return inv_diag * x
+                        M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
+                        if self.cg_verbose:
+                            print(f"[cupy][cg] cupy jacobi preconditioner (legate-sparse not available)")
 
                 # (3) RHS & warm start
                 b_gpu = cp.asarray(b)
@@ -815,7 +850,42 @@ class SparseLinearSolver(LinearSolver):
                 # lu = cupy.sparse.linalg.splu(A_gpu)
                 
                 try:
-                    x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
+                    if self.preconditioner == 'legat' and self.have_legate_sparse:
+                        # Use legate-sparse CG solver
+                        if self.cg_verbose:
+                            print("[legate-sparse][cg] using legate-sparse CG solver")
+                        
+                        # Convert CuPy matrix to legate-sparse format
+                        A_ls = ls.csr_matrix((A_gpu.data, A_gpu.indices, A_gpu.indptr), shape=A_gpu.shape)
+                        
+                        # Convert CuPy arrays to cupynumeric arrays
+                        b_cn = cn.asarray(b_gpu)
+                        if x0 is not None:
+                            x0_cn = cn.asarray(x0)
+                        else:
+                            x0_cn = None
+                        
+                        # Convert preconditioner to legate-sparse format if needed
+                        if M is not None and hasattr(M, 'matvec'):
+                            # Wrap the CuPy LinearOperator for legate-sparse
+                            def M_ls(x):
+                                return cn.asarray(M.matvec(cp.asnumpy(x)))
+                            M_ls_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls, dtype=A_gpu.dtype)
+                        else:
+                            M_ls_op = None
+                        
+                        # Use legate-sparse CG
+                        x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_op)
+                        
+                        # Convert back to CuPy
+                        x_gpu = cp.asarray(cn.asnumpy(x_cn))
+                        
+                        # Update iteration counter (legate-sparse doesn't provide callback, so we can't count iterations)
+                        it_counter['k'] = max_iter if info == 0 else max_iter  # Approximation
+                        
+                    else:
+                        # Use CuPy CG solver
+                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
                 except ValueError as ve:
                     # Auto-fallback if block_jacobi caused dimensional issue
                     if self.preconditioner == 'block_jacobi' and 'incompatible dimensions' in str(ve).lower():
@@ -826,10 +896,23 @@ class SparseLinearSolver(LinearSolver):
                         def mv(x):
                             return inv_diag * x
                         M_fallback = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                        it_counter = {'k': 0}
-                        def _cb_fb(_):
-                            it_counter['k'] += 1
-                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=None, tol=self.cg_tol, maxiter=max_iter, M=M_fallback, callback=_cb_fb)
+                        
+                        if self.preconditioner == 'legat' and self.have_legate_sparse:
+                            # Use legate-sparse CG with fallback preconditioner
+                            A_ls = ls.csr_matrix((A_gpu.data, A_gpu.indices, A_gpu.indptr), shape=A_gpu.shape)
+                            b_cn = cn.asarray(b_gpu)
+                            x0_cn = None
+                            def M_ls_fb(x):
+                                return cn.asarray(M_fallback.matvec(cp.asnumpy(x)))
+                            M_ls_fb_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls_fb, dtype=A_gpu.dtype)
+                            x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_fb_op)
+                            x_gpu = cp.asarray(cn.asnumpy(x_cn))
+                            it_counter['k'] = max_iter if info == 0 else max_iter
+                        else:
+                            it_counter = {'k': 0}
+                            def _cb_fb(_):
+                                it_counter['k'] += 1
+                            x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=None, tol=self.cg_tol, maxiter=max_iter, M=M_fallback, callback=_cb_fb)
                     else:
                         raise
                 cp.cuda.get_current_stream().synchronize()
@@ -998,7 +1081,7 @@ class FDMDerivatives():
     def du_dz_central(u, h):
         du = torch.zeros_like(u)
         du[:,:,:, 1:-1] = (u[:,:,:,  2:] - u[:,:,:, 0:-2]) / (2 * h[2])
-        du[:,:,:,  0  ] = (u[:,:,:,  1 ] - u[:,:,:,  0  ]) / h[2]
+        du[:,:,:,  0  ] = (u[:,:,:,  1 ] - u[:,:,:, 0  ]) / h[2]
         du[:,:,:, -1  ] = (u[:,:,:, -1 ] - u[:,:,:, -2  ]) / h[2]
         return du
 
