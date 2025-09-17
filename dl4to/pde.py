@@ -160,7 +160,7 @@ class SparseLinearSolver(LinearSolver):
                  warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
                  warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
                  warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'jacobi',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx' | 'legat'
+                 preconditioner: str = 'legat',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx' | 'legat'
                  amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
                  amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
                  amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
@@ -748,9 +748,14 @@ class SparseLinearSolver(LinearSolver):
                     if self.have_legate_sparse:
                         # Use legate-sparse Jacobi preconditioner
                         diag = A_gpu.diagonal()
-                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        inv_diag_cp = cp.where(diag != 0, 1.0 / diag, 1.0)
+                        inv_diag_np = np.asarray(inv_diag_cp.get())
+                        inv_diag_cn = cn.asarray(inv_diag_np)
                         def mv(x):
-                            return inv_diag * x
+                            # Convert input to cupynumeric array if needed
+                            x_np = np.asarray(x)
+                            x_cn = cn.asarray(x_np)
+                            return inv_diag_cn * x_cn
                         M = ls_LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                         if self.cg_verbose:
                             print(f"[cupy][cg] legate-sparse jacobi preconditioner")
@@ -855,34 +860,40 @@ class SparseLinearSolver(LinearSolver):
                         if self.cg_verbose:
                             print("[legate-sparse][cg] using legate-sparse CG solver")
                         
-                        # Convert CuPy matrix to legate-sparse format
-                        A_ls = ls.csr_matrix((A_gpu.data, A_gpu.indices, A_gpu.indptr), shape=A_gpu.shape)
-                        
-                        # Convert CuPy arrays to cupynumeric arrays
-                        b_cn = cn.asarray(b_gpu)
-                        if x0 is not None:
-                            x0_cn = cn.asarray(x0)
-                        else:
-                            x0_cn = None
-                        
-                        # Convert preconditioner to legate-sparse format if needed
+                        # Convert CuPy matrix to legate-sparse format using NumPy directly
+                        data_np = np.asarray(A_gpu.data.get())
+                        indices_np = np.asarray(A_gpu.indices.get()).astype(np.uint64)
+                        indptr_np = np.asarray(A_gpu.indptr.get()).astype(np.uint64)
+                        data_cn = cn.asarray(data_np)
+                        indices_cn = cn.asarray(indices_np, dtype=np.uint64)
+                        indptr_cn = cn.asarray(indptr_np, dtype=np.uint64)
+                        A_ls = ls.csr_matrix((data_cn, indices_cn, indptr_cn), shape=A_gpu.shape)
+
+                        # Convert b and x0 to NumPy arrays
+                        b_np = np.asarray(b_gpu.get(), dtype=np.float64)  # Ensure float64
+                        b_cn = cn.asarray(b_np)
+                        x0_cn = cn.asarray(np.asarray(x0.get())) if x0 is not None else None
+
+                        # Define preconditioner for legate-sparse
                         if M is not None and hasattr(M, 'matvec'):
-                            # Wrap the CuPy LinearOperator for legate-sparse
                             def M_ls(x):
-                                return cn.asarray(M.matvec(cp.asnumpy(x)))
+                                x_np = np.asarray(x)
+                                result_np = np.asarray(M.matvec(x_np))
+                                return cn.asarray(result_np)
                             M_ls_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls, dtype=A_gpu.dtype)
                         else:
                             M_ls_op = None
-                        
-                        # Use legate-sparse CG
+
+                        # Solve using legate-sparse CG
+                        breakpoint()
                         x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_op)
-                        
-                        # Convert back to CuPy
-                        x_gpu = cp.asarray(cn.asnumpy(x_cn))
-                        
-                        # Update iteration counter (legate-sparse doesn't provide callback, so we can't count iterations)
-                        it_counter['k'] = max_iter if info == 0 else max_iter  # Approximation
-                        
+
+                        # Convert result back to NumPy
+                        x_np = np.asarray(x_cn)
+                        x_gpu = cp.asarray(x_np)
+
+                        # Update iteration counter
+                        it_counter['k'] = max_iter if info == 0 else max_iter
                     else:
                         # Use CuPy CG solver
                         x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
@@ -899,14 +910,26 @@ class SparseLinearSolver(LinearSolver):
                         
                         if self.preconditioner == 'legat' and self.have_legate_sparse:
                             # Use legate-sparse CG with fallback preconditioner
-                            A_ls = ls.csr_matrix((A_gpu.data, A_gpu.indices, A_gpu.indptr), shape=A_gpu.shape)
-                            b_cn = cn.asarray(b_gpu)
+                            data_np = np.asarray(A_gpu.data)
+                            indices_np = np.asarray(A_gpu.indices).astype(np.uint64)
+                            indptr_np = np.asarray(A_gpu.indptr).astype(np.uint64)
+                            data_cn = cn.asarray(data_np)
+                            indices_cn = cn.asarray(indices_np, dtype=np.uint64)
+                            indptr_cn = cn.asarray(indptr_np, dtype=np.uint64)
+                            A_ls = ls.csr_matrix((data_cn, indices_cn, indptr_cn), shape=A_gpu.shape)
+                            b_np = np.asarray(b_gpu)
+                            b_cn = cn.asarray(b_np)
                             x0_cn = None
                             def M_ls_fb(x):
-                                return cn.asarray(M_fallback.matvec(cp.asnumpy(x)))
+                                # Convert to numpy array using __array__ method via np.asarray
+                                x_np = np.asarray(x)
+                                result_cp = M_fallback.matvec(cp.asarray(x_np))
+                                result_np = np.asarray(result_cp)
+                                return cn.asarray(result_np)
                             M_ls_fb_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls_fb, dtype=A_gpu.dtype)
                             x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_fb_op)
-                            x_gpu = cp.asarray(cn.asnumpy(x_cn))
+                            x_np = np.asarray(x_cn)
+                            x_gpu = cp.asarray(x_np)
                             it_counter['k'] = max_iter if info == 0 else max_iter
                         else:
                             it_counter = {'k': 0}
@@ -934,7 +957,12 @@ class SparseLinearSolver(LinearSolver):
                     self._warm_cache[phase] = cache
 
                 # Store last iterations (info==0 -> success) using counter if available
-                self._last_cg_iters = it_counter['k'] if it_counter['k'] > 0 else (info if isinstance(info, int) and info > 0 else None)
+                if isinstance(it_counter.get('k'), int) and it_counter['k'] > 0:
+                    self._last_cg_iters = it_counter['k']
+                elif isinstance(info, int) and info > 0:
+                    self._last_cg_iters = info
+                else:
+                    self._last_cg_iters = None
                 if self.cg_verbose:
                     it_disp = self._last_cg_iters if self._last_cg_iters is not None else 'NA'
                     print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it={it_disp} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
@@ -946,7 +974,7 @@ class SparseLinearSolver(LinearSolver):
                     if θ_current is not None:
                         try:
                             θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
-                            cur_mean = float(cp.mean(θ_cur_gpu).get())
+                            cur_mean = float(np.asarray(cp.mean(θ_cur_gpu)))
                             if st['prev_mean'] is None:
                                 st['prev_mean'] = cur_mean
                             dmean = abs(cur_mean - st['prev_mean'])
@@ -1642,6 +1670,7 @@ class UnpaddedFDM(PDESolver):
 
     def _get_b(self):
         b = self.problem.F
+        b = self._get_padded_tensor(b)
         b[self.Ω_dirichlet] = 0
         b /= self.problem.E
         return b
@@ -1683,26 +1712,24 @@ class UnpaddedFDM(PDESolver):
         return σ
 
 
-    def _stack_if_tensor_else_return_none(self, list):
-        if any(type(entry) is not torch.Tensor for entry in list):
-            return None
-        return torch.stack(list)
-
-
     def solve_pde(self,
                  solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
                  p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                 binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
+                 binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
+                 get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
                 ):
         """
         Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
         """
-        u = self._get_u(solution, p=p, binary=binary)
-        σ = self._get_σ(solution, p=p, u=u, binary=binary)
+        u = self._get_u(solution, p=p, binary=binary, get_padded=True)
+        σ = self._get_σ(solution, p=p, u=u, binary=binary, get_padded=True)
         σ_vm = get_σ_vm(σ)
-        return u, σ, σ_vm
+        if get_padded:
+            return u, σ, σ_vm
+        return self._remove_padding(u), self._remove_padding(σ), self._remove_padding(σ_vm)
+    
 
-# Cell
+    # Cell
 class FDM(UnpaddedFDM):
     """
     A PDE solver for linear elasticity that uses the finite differences method (FDM) with padding.
