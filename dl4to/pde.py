@@ -149,29 +149,22 @@ class SparseLinearSolver(LinearSolver):
     A sparse linear solver that uses scipy (CPU) and optionally cupy (GPU) if available.
     """
     def __init__(self,
+                 optimizer: str = "scipy", # "scipy", "cupy", "legate", "amgx"
                  use_umfpack: bool = True,
                  factorize: bool = False,
-                 use_amgx: bool = False,
-                 use_cupy: bool = True,
                  cg_tol: float = 1e-6,
                  cg_max_iter: int = None,
                  cg_verbose: bool = True,
                  warm_start: bool = True,
-                 warm_similarity_threshold: float = 0.9,  # RHS cosine similarity threshold (legacy)
-                 warm_theta_tol: float = 1e-3,            # Absolute mean(θ) change tolerance for warm reuse
-                 warm_strategy: str = 'theta',            # 'theta' | 'rhs' | 'both'
-                 preconditioner: str = 'legat',    # 'none' | 'jacobi' | 'block_jacobi' | 'amg' | 'amgx' | 'legat'
-                 amg_smooth_steps: int = 4,               # GPU approx AMG: base Jacobi smoothing iterations
-                 amg_omega: float = 0.75,                 # GPU approx AMG: damping factor
-                 amg_adaptive: bool = True,               # Adapt smoothing based on previous CG iterations
-                 amg_min_smooth_steps: int = 1            # Minimum smoothing steps when adapting
+                 warm_similarity_threshold: float = 0.9,
+                 warm_theta_tol: float = 1e-3,
+                 warm_strategy: str = 'theta',
+                 preconditioner: str = 'jacobi', # 'none', 'jacobi', 'legat'
+                 amgx_config: dict = None
                  ):
-        # Basic config
+        self.optimizer = optimizer.lower()
         self.use_umfpack = use_umfpack
-        self.use_cupy_requested = use_cupy
-        self.use_amgx_requested = use_amgx
-        self.have_cupy = False
-        self.backend = "scipy"
+        self.factorize = factorize
         self.cg_tol = cg_tol
         self.cg_max_iter = cg_max_iter
         self.cg_verbose = cg_verbose
@@ -182,242 +175,60 @@ class SparseLinearSolver(LinearSolver):
         if self.warm_strategy not in ['theta', 'rhs', 'both']:
             raise ValueError("warm_strategy must be one of 'theta', 'rhs', 'both'")
         self.preconditioner = preconditioner.lower()
-        if self.preconditioner not in ['none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', "amgx", "legat"]:
-            raise ValueError("preconditioner must be 'none', 'jacobi', 'block_jacobi', 'amg', 'lu', 'splu', 'amgx', or 'legat'")
-
-        # AMG cache (CPU pattern reuse)
-        self._amg_hierarchy = None
-        self._amg_key = None
-        # GPU approximate AMG cached components & parameters
-        self._amg_diag_inv = None
-        self._last_cg_iters = None
-        self.amg_smooth_steps = amg_smooth_steps
-        self.amg_omega = amg_omega
-        self.amg_adaptive = amg_adaptive
-        self.amg_min_smooth_steps = amg_min_smooth_steps
-        # Block-Jacobi cache config
-        self.bj_cache = True
-        self.bj_theta_tol = 1e-3
-        self.bj_rebuild_every = 0  # 0 disables periodic rebuild
-        # Cached state for block-jacobi (interleaved)
-        self._bj_cache = {
-            'key': None,             # pattern key
-            'offsets': None,         # cp.ndarray (N,3,3) absolute indices into csr.data (-1 if missing)
-            'inv_blocks': None,      # cp.ndarray (N,3,3)
-            'operator': None,        # LinearOperator capturing inv_blocks reference
-            'theta_prev': None,      # cp.ndarray (N,)
-            'N': 0,                  # number of nodes
-            'build_count': 0         # times rebuilt fully
-        }
-        # Auto-freeze/unfreeze controls for BJ updates
-        self.bj_freeze_enabled = True
-        self.bj_freeze_patience = 3          # consecutive small-Δθ steps to freeze
-        self.bj_freeze_theta_tol = 1e-4      # mean(θ) change threshold to count as "stable"
-        self.bj_unfreeze_iter_jump = 1.5     # if CG iters jump by this factor vs baseline, unfreeze
-        self._bj_freeze_state = {
-            'frozen': False,
-            'stable_steps': 0,
-            'prev_mean': None,
-            'baseline_iters': None,
-            'step': 0
-        }
-        # Partial update controls
-        self.bj_update_fraction = 0.2       # update at most 20% nodes per refresh
-        self.bj_min_update = 4096           # but at least this many nodes
-        self.bj_update_period = 1           # perform value update every k solves (1 = every time)
-        self.bj_partitions = 1              # round-robin partitions (1 = disabled)
-
-        # GPU structural cache
-        self._gpu_shape = None
-        self._gpu_indices = None
-        self._gpu_indptr = None
-
-        # Phase separated warm caches: {'forward': {'x': cp.array, 'b': cp.array}, 'adjoint': {...}}
+        if self.preconditioner not in ['none', 'jacobi', 'legat']:
+            raise ValueError("preconditioner must be 'none', 'jacobi', or 'legat'")
+        self.amgx_config = amgx_config
+        self.have_cupy = False
+        self.have_legate_sparse = have_legate_sparse
+        self.have_pyamgx = False
         self._warm_cache = {
             'forward': {'x': None, 'b': None, 'θ': None},
             'adjoint': {'x': None, 'b': None, 'θ': None}
         }
-        # AGMX availability
-        if self.use_amgx_requested:
+        if self.optimizer == "cupy":
             try:
-                import pyamgx  # noqa: F401
-                self.have_pyamgx = True
-                if self.cg_verbose:
-                    print("[amgx] PyAMGX GPU solver enabled.")
-            except ImportError:
-                self.have_pyamgx = False
-                warnings.warn("pyamgx not installed; falling back to scipy/cupy backend.")
-
-        # Cupy availability
-        if use_cupy:
-            try:
-                import cupy  # noqa: F401
+                import cupy
                 if torch.cuda.is_available():
                     self.have_cupy = True
-                    self.backend = "cupy"
                 else:
                     warnings.warn("CUDA not available; falling back to scipy backend.")
             except ImportError:
                 warnings.warn("cupy not installed; falling back to scipy backend.")
-
-        # Factorization only for CPU
-        if self.have_cupy and factorize:
-            warnings.warn("Factorization not supported with cupy backend. Disabling factorization.")
-            factorize = False
-
-        # If GPU: we'll implement a lightweight approximate AMG (multi-step Jacobi inverse) directly
-        if self.preconditioner == 'amg' and self.have_cupy:
-            if self.cg_verbose:
-                print("[amg] GPU approximate AMG enabled (multi-step Jacobi smoother).")
-
-        if self.preconditioner == 'amg' and factorize:
-            warnings.warn("AMG conflicts with direct factorization; switching to iterative (factorize=False).")
-            self.factorize = False
-
-        if (use_umfpack or factorize) and (importlib.util.find_spec('scikits') is None) and (self.backend == "scipy"):
-            warnings.warn("scikits.umfpack not installed. Falling back to default scipy solver.")
-
-        # Legate-sparse availability
-        self.have_legate_sparse = have_legate_sparse
-        if self.use_cupy_requested and self.have_legate_sparse:
-            if self.cg_verbose:
-                print("[legate-sparse] GPU solver enabled.")
-
+        if self.optimizer == "legate":
+            if not self.have_legate_sparse:
+                warnings.warn("legate-sparse not installed; falling back to scipy backend.")
+        if self.optimizer == "amgx":
+            try:
+                import pyamgx
+                self.have_pyamgx = True
+            except ImportError:
+                warnings.warn("pyamgx not installed; falling back to scipy backend.")
         super().__init__(factorize)
 
-    # def _solver(self):
-    #     def amg_solver(A, b):
-    #         # key = A.shape + (A.nnz,)
-    #         # if key not in self.ml_cache:
-    #         #     print("[pyamg] Building new AMG hierarchy for matrix shape", A.shape)
-    #         #     self.ml_cache[key] = pyamg.smoothed_aggregation_solver(A)
-    #         # ml = self.ml_cache[key]
-    #         ml = pyamg.smoothed_aggregation_solver(A.tocsr())
-            
-    #         x = ml.solve(b, tol=1e-10, accel='cg')
-    #         return x
-    #     return amg_solver
-
     def _solver(self):
-        # --- PyAMGX GPU solver integration ---
-        try:
+        # --- Explicitly select solver based on optimizer ---
+        if self.optimizer == "amgx" and self.have_pyamgx:
             import pyamgx
-            self.have_pyamgx = True
-        except ImportError:
-            self.have_pyamgx = False
-
-        if self.have_pyamgx and self.preconditioner == 'amgx':
-            # PyAMGX config (can be made user-configurable)
-            def default_amgx_config(tol):
-                return {
-                "config_version": 2,
-                "determinism_flag": 1,
-                "solver": {
-                    "preconditioner": {
-                        "print_grid_stats": 1,
-                        "algorithm": "AGGREGATION",
-                        "print_vis_data": 0,
-                        "solver": "AMG",
-                        "smoother": {
-                            "relaxation_factor": 0.8,
-                            "scope": "jacobi",
-                            "solver": "BLOCK_JACOBI",
-                            "monitor_residual": 0,
-                            "print_solve_stats": 0
-                        },
-                        "print_solve_stats": 0,
-                        "presweeps": 0,
-                        "interpolator": "D2",
-                        "selector": "SIZE_2",
-                        "coarse_solver": "NOSOLVER",
-                        "max_iters": 1,
-                        "monitor_residual": 0,
-                        "store_res_history": 0,
-                        "scope": "amg",
-                        "max_levels": 50,
-                        "postsweeps": 3,
-                        "cycle": "V"
-                    },
-                    "solver": "PCG",
-                    "print_solve_stats": 1,
-                    "obtain_timings": 1,
-                    "max_iters": 100,
-                    "monitor_residual": 1,
-                    "convergence": "RELATIVE_INI",
-                    "scope": "main",
-                    "tolerance": 1e-06,
-                    "norm": "L2"
-                }
-            }
-
-            # Cache AMGX objects for constant sparsity pattern
-            if not hasattr(self, '_amgx_cache'):
-                self._amgx_cache = {
-                    'shape': None,
-                    'nnz': None,
-                    'Am': None,
-                    'solver': None,
-                    'rsrc': None,
-                    'cfg_obj': None
-                }
-
-            # --- PyAMGX global init/finalize guard ---
-            import threading
-            _amgx_global_lock = threading.Lock()
-            if not hasattr(pyamgx, '_dl4to_initialized'):
-                pyamgx._dl4to_initialized = False
-
-            def amgx_global_init():
-                with _amgx_global_lock:
-                    if not pyamgx._dl4to_initialized:
-                        pyamgx.initialize()
-                        pyamgx._dl4to_initialized = True
-
             def solve_gpu_amgx(A, b, phase='forward', θ_current=None):
-                import numpy as np
-                import time
-                amgx_global_init()
-                # Only support float64
-                if A.dtype != np.float64:
-                    A = A.astype(np.float64)
-                n = A.shape[0]
-                # --- Matrix diagnostics ---
-                diag = A.diagonal()
-                print(f"[AMGX] Matrix shape: {A.shape}, nnz: {A.nnz}")
-                print(f"[AMGX] Diagonal: min={diag.min():.3e}, max={diag.max():.3e}, mean={diag.mean():.3e}")
-                # Check for positive semi-definiteness (all diag >= 0)
-                neg_diag = np.sum(diag < -1e-12)
-                if neg_diag > 0:
-                    print(f"[AMGX][WARNING] Matrix diagonal has {neg_diag} negative entries! Matrix may not be positive semi-definite.")
-                # Check for NaNs or infs
-                nan_count = np.sum(np.isnan(diag))
-                inf_count = np.sum(np.isinf(diag))
-                if nan_count > 0 or inf_count > 0:
-                    print(f"[AMGX][ERROR] Matrix diagonal contains {nan_count} NaN and {inf_count} Inf!")
-                # Check condition number estimate
-                if diag.min() > 0:
-                    cond_est = diag.max() / diag.min()
-                    print(f"[AMGX] Diagonal condition number estimate: {cond_est:.2e}")
-                else:
-                    print("[AMGX][WARNING] Zero or negative diagonal entries prevent condition number estimate")
-                # Always create new AMGX objects, no caching
-                cfg_dict = default_amgx_config(self.cg_tol)
+                # Use provided config or default
+                cfg_dict = self.amgx_config if self.amgx_config is not None else {
+                    "config_version": 2,
+                    "determinism_flag": 1,
+                    "solver": {
+                        "preconditioner": {"algorithm": "AGGREGATION", "solver": "AMG"},
+                        "solver": "PCG",
+                        "max_iters": 100,
+                        "tolerance": self.cg_tol,
+                        "norm": "L2"
+                    }
+                }
                 cfg_obj = pyamgx.Config().create_from_dict(cfg_dict)
                 rsrc = pyamgx.Resources().create_simple(cfg_obj)
                 solver = pyamgx.Solver().create(rsrc, cfg_obj)
                 mode = "dDDI"
                 Am = pyamgx.Matrix().create(rsrc, mode)
-                try:
-                    Am.upload_CSR(A.tocsr())
-                except TypeError:
-                    indptr_i32 = A.indptr.astype(np.int32, copy=False)
-                    indices_i32 = A.indices.astype(np.int32, copy=False)
-                    data_cast = A.data
-                    try:
-                        Am.upload_CSR(shape=A.shape, row_ptrs=indptr_i32, col_indices=indices_i32, data=data_cast)
-                    except TypeError:
-                        Am.upload_CSR(A.shape[0], indptr_i32, indices_i32, data_cast)
-                solver.setup(Am)
+                Am.upload_CSR(A.tocsr())
+                n = A.shape[0]
                 xb = pyamgx.Vector().create(rsrc, mode)
                 bb = pyamgx.Vector().create(rsrc, mode)
                 xb.upload(np.zeros(n, dtype=np.float64))
@@ -428,615 +239,75 @@ class SparseLinearSolver(LinearSolver):
                 return x
             return solve_gpu_amgx
 
-        if self.have_cupy:
-            # GPU solver
-            def solve_gpu(A, b, phase='forward', θ_current=None):
-                import numpy as np
-                import cupy as cp
-                # Matrix diagnostics (similar to AMGX)
-                diag = A.diagonal()
-                print(f"[CuPy] Matrix shape: {A.shape}, nnz: {A.nnz}")
-                print(f"[CuPy] Diagonal: min={diag.min():.3e}, max={diag.max():.3e}, mean={diag.mean():.3e}")
-                neg_diag = np.sum(diag < -1e-12)
-                if neg_diag > 0:
-                    print(f"[CuPy][WARNING] Matrix diagonal has {neg_diag} negative entries! Matrix may not be positive semi-definite.")
-                nan_count = np.sum(np.isnan(diag))
-                inf_count = np.sum(np.isinf(diag))
-                if nan_count > 0 or inf_count > 0:
-                    print(f"[CuPy][ERROR] Matrix diagonal contains {nan_count} NaN and {inf_count} Inf!")
-                if diag.min() > 0:
-                    cond_est = diag.max() / diag.min()
-                    print(f"[CuPy] Diagonal condition number estimate: {cond_est:.2e}")
-                else:
-                    print("[CuPy][WARNING] Zero or negative diagonal entries prevent condition number estimate")
-                # Reuse indices/indptr if shape unchanged to avoid repeated allocations
-                if (self._gpu_shape != A.shape) or (self._gpu_indices is None) or (self._gpu_indptr is None):
-                    # Rebuild sparsity pattern if:
-                    # - shape changed
-                    # - first time (_gpu_indices/_gpu_indptr None)
-                    # - nnz changed (e.g. different Dirichlet mask or structural modification)
-                    if (self._gpu_shape != A.shape) or \
-                       (self._gpu_indices is None) or \
-                       (self._gpu_indptr is None) or \
-                       (getattr(self, "_gpu_nnz", None) != A.nnz):
-                        self._gpu_shape = A.shape
-                        self._gpu_indices = cp.asarray(A.indices)
-                        self._gpu_indptr = cp.asarray(A.indptr)
-                        self._gpu_nnz = A.nnz
-                # Always upload fresh numeric values (data changes each call)
+        if self.optimizer == "cupy" and self.have_cupy:
+            import cupy as cp
+            from cupyx.scipy.sparse import csc_matrix as cp_csc_matrix
+            from cupyx.scipy.sparse.linalg import cg as cg_spsolve, LinearOperator
+            def solve_gpu_cupy(A, b, phase='forward', θ_current=None):
+                # Only allow jacobi and legat preconditioners for cupy
                 data_gpu = cp.asarray(A.data)
-                A_gpu = cp_csc_matrix((data_gpu, self._gpu_indices, self._gpu_indptr), shape=A.shape)
-
-                # Direct GPU sparse solve if requested (uses cupyx.scipy.sparse.linalg.spsolve)
-                if self.preconditioner in ['lu', 'splu']:
-                    
-                    from scipy.sparse.linalg import splu as scipy_splu
-                    def solve_gpu_direct(A, b, phase='forward', θ_current=None):
-                        start_time = time.time()
-                        if "lu" not in self.cache:
-                            # we do it once
-                            self.cache['lu'] = scipy_splu(A_gpu.tocsc())
-                        x = self.cache['lu'](A, b)
-                        if self.cg_verbose:
-                            print(f"[cpu][{"splu"}] phase={phase} n={A.shape[0]} time={time.time()-start_time:.3f}s")
-                        return x
-                    return solve_gpu_direct
-
-                # (2) Build / select preconditioner for CG
+                indices_gpu = cp.asarray(A.indices)
+                indptr_gpu = cp.asarray(A.indptr)
+                A_gpu = cp_csc_matrix((data_gpu, indices_gpu, indptr_gpu), shape=A.shape)
                 M = None
-                if self.preconditioner == 'none':
-                    M = None
-                elif self.preconditioner == 'jacobi':
+                if self.preconditioner == 'jacobi':
                     diag = A_gpu.diagonal()
                     inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
                     def mv(x):
                         return inv_diag * x
                     M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                elif self.preconditioner == 'block_jacobi':
-                        def create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu, theta_vec=None):
-                            n_dofs = A_gpu.shape[0]
-                            if n_dofs % 3 != 0:
-                                diag = A_gpu.diagonal()
-                                inv_diag = cp.where(cp.abs(diag) > 1e-12, 1.0 / diag, 0.0)
-                                def mv(x):
-                                    return inv_diag * x
-                                return LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-
-                            N = n_dofs // 3
-                            # Pattern key using cheap hashes on indices/indptr
-                            csr = A_gpu.tocsr()
-                            try:
-                                key = (A_gpu.shape,
-                                       int(A_gpu.nnz),
-                                       int(csr.indptr.size), int(csr.indices.size),
-                                       int(cp.sum(csr.indptr.astype(cp.int64)).get()),
-                                       int(cp.sum(csr.indices.astype(cp.int64)).get()))
-                            except Exception:
-                                key = (A_gpu.shape, int(A_gpu.nnz))
-
-                            cache = self._bj_cache
-                            new_pattern = (not self.bj_cache) or (cache['key'] != key) or (cache['N'] != N)
-                            do_full_rebuild = new_pattern
-                            # Optional periodic full rebuild
-                            if (not do_full_rebuild) and (self.bj_rebuild_every and (cache['build_count'] % self.bj_rebuild_every == 0)):
-                                do_full_rebuild = True
-
-                            if do_full_rebuild:
-                                # Build offsets and full blocks
-                                if self.cg_verbose:
-                                    print(f"[cupy][cg][block_jacobi] full build N={N} nnz={A_gpu.nnz}")
-                                t0 = time.time()
-                                offsets = cp.full((N,3,3), -1, dtype=cp.int64)
-                                blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
-                                for i_node in range(N):
-                                    base_row = 3 * i_node
-                                    for r in range(3):
-                                        row_idx = base_row + r
-                                        rs = csr.indptr[row_idx]; re = csr.indptr[row_idx + 1]
-                                        cols = csr.indices[rs:re]
-                                        # For each target column position
-                                        for c in range(3):
-                                            col_idx = base_row + c
-                                            pos = cp.where(cols == col_idx)[0]
-                                            if pos.size > 0:
-                                                offsets[i_node, r, c] = rs + pos[0].astype(cp.int64)
-                                # Gather block values using offsets
-                                data_arr = csr.data
-                                for r in range(3):
-                                    for c in range(3):
-                                        off = offsets[:, r, c]
-                                        mask = off >= 0
-                                        vals = cp.zeros(N, dtype=A_gpu.dtype)
-                                        if mask.any():
-                                            vals[mask] = data_arr[off[mask]]
-                                        blocks[:, r, c] = vals
-                                cache['offsets'] = offsets
-                                cache['key'] = key
-                                cache['N'] = N
-                                cache['build_count'] += 1
-                                if self.cg_verbose:
-                                    print(f"[cupy][cg][block_jacobi] offsets built in {time.time()-t0:.3f}s")
-                            else:
-                                # Reuse offsets and selectively update changed nodes
-                                offsets = cache['offsets']
-                                # If frozen, skip all value updates and reuse existing inv_blocks
-                                if self.bj_freeze_enabled and self._bj_freeze_state.get('frozen', False):
-                                    if self.cg_verbose:
-                                        print("[cupy][cg][block_jacobi] frozen: skipping value update")
-                                    # Ensure inv_blocks exists
-                                    if cache.get('inv_blocks') is None:
-                                        raise RuntimeError("Block-Jacobi frozen without existing inv_blocks; this should not happen.")
-                                    # Short-circuit to matvec creation using existing inv_blocks
-                                    blocks = None  # signal no-recompute
-                                else:
-                                    # Respect update period
-                                    if (self.bj_update_period > 1) and (self._bj_freeze_state.get('step', 0) % self.bj_update_period != 0):
-                                        if self.cg_verbose:
-                                            print(f"[cupy][cg][block_jacobi] skip update (period={self.bj_update_period})")
-                                        blocks = None
-                                    else:
-                                        # Compute changed set and optionally throttle updates
-                                        data_arr = csr.data
-                                        # If theta available, update only changed nodes, else all
-                                        if theta_vec is not None and cache.get('theta_prev') is not None and theta_vec.size == cache['theta_prev'].size:
-                                            dθ = cp.abs(theta_vec - cache['theta_prev'])
-                                            changed = (dθ > self.bj_theta_tol)
-                                        else:
-                                            dθ = None
-                                            changed = cp.ones(N, dtype=cp.bool_)
-                                        # Round-robin partitioning if enabled
-                                        part_mask = cp.ones(N, dtype=cp.bool_)
-                                        if self.bj_partitions and self.bj_partitions > 1:
-                                            step = int(self._bj_freeze_state.get('step', 0))
-                                            part = step % self.bj_partitions
-                                            # Nodes assigned by modulo on index
-                                            idx_all = cp.arange(N)
-                                            part_mask = (idx_all % self.bj_partitions) == part
-                                        candidates = changed & part_mask
-                                        idx = cp.where(candidates)[0]
-                                        if idx.size == 0:
-                                            blocks = None
-                                        else:
-                                            # Throttle update count
-                                            if self.bj_update_fraction < 1.0:
-                                                max_update = int(max(self.bj_min_update, self.bj_update_fraction * N / max(1, self.bj_partitions)))
-                                                if idx.size > max_update:
-                                                    if dθ is not None:
-                                                        # pick top-k by dθ among candidates
-                                                        dθ_cand = dθ[idx]
-                                                        k = max_update
-                                                        # argpartition for top-k indices
-                                                        sel = cp.argpartition(-dθ_cand, k-1)[:k]
-                                                        idx = idx[sel]
-                                                    else:
-                                                        # no dθ available, take first k
-                                                        idx = idx[:max_update]
-                                            # Gather values for selected nodes
-                                            blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
-                                            for r in range(3):
-                                                for c in range(3):
-                                                    off = offsets[idx, r, c]
-                                                    mask = off >= 0
-                                                    vals = cp.zeros(idx.size, dtype=A_gpu.dtype)
-                                                    if mask.any():
-                                                        vals[mask] = data_arr[off[mask]]
-                                                    blocks[idx, r, c] = vals
-                                    blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
-                                    data_arr = csr.data
-                                    # If theta available, update only changed nodes, else all
-                                    if theta_vec is not None and cache.get('theta_prev') is not None and theta_vec.size == cache['theta_prev'].size:
-                                        dθ = cp.abs(theta_vec - cache['theta_prev'])
-                                        changed = (dθ > self.bj_theta_tol)
-                                    else:
-                                        changed = cp.ones(N, dtype=cp.bool_)
-                                    # Gather values for changed nodes
-                                    idx = cp.where(changed)[0]
-                                    if idx.size > 0:
-                                        for r in range(3):
-                                            for c in range(3):
-                                                off = offsets[idx, r, c]
-                                                mask = off >= 0
-                                                vals = cp.zeros(idx.size, dtype=A_gpu.dtype)
-                                                if mask.any():
-                                                    vals[mask] = data_arr[off[mask]]
-                                                blocks[idx, r, c] = vals
-                                    # For unchanged nodes, keep previous inv_blocks (no need to fill blocks)
-
-                            if blocks is not None:
-                                a = blocks[:, 0, 0]; b = blocks[:, 0, 1]; c_ = blocks[:, 0, 2]
-                                d = blocks[:, 1, 0]; e = blocks[:, 1, 1]; f = blocks[:, 1, 2]
-                                g = blocks[:, 2, 0]; h = blocks[:, 2, 1]; i_ = blocks[:, 2, 2]
-                                det = (a * (e * i_ - f * h) - b * (d * i_ - f * g) + c_ * (d * h - e * g))
-                                det_safe = cp.where(cp.abs(det) > 1e-12, det, cp.sign(det) * 1e-12)
-                                if self.cg_verbose and (do_full_rebuild or (idx.size if 'idx' in locals() else N) == N):
-                                    det_abs = cp.abs(det)
-                                    det_min = float(det_abs.min().get()) if det_abs.size else 0.0
-                                    det_max = float(det_abs.max().get()) if det_abs.size else 0.0
-                                    det_mean = float(det_abs.mean().get()) if det_abs.size else 0.0
-                                    near = int((det_abs < 1e-12).sum().get())
-                                    print(f"[cupy][cg][block_jacobi] det stats |min|={det_min:.3e} |max|={det_max:.3e} |mean|={det_mean:.3e} near_sing={near}")
-
-                            # Initialize or update inverse blocks
-                            if blocks is None:
-                                inv_blocks = cache['inv_blocks']
-                            elif do_full_rebuild or cache.get('inv_blocks') is None:
-                                inv_blocks = cp.zeros((N, 3, 3), dtype=A_gpu.dtype)
-                                inv_blocks[:, 0, 0] = (e * i_ - f * h) / det_safe
-                                inv_blocks[:, 0, 1] = (c_ * h - b * i_) / det_safe
-                                inv_blocks[:, 0, 2] = (b * f - c_ * e) / det_safe
-                                inv_blocks[:, 1, 0] = (f * g - d * i_) / det_safe
-                                inv_blocks[:, 1, 1] = (a * i_ - c_ * g) / det_safe
-                                inv_blocks[:, 1, 2] = (c_ * d - a * f) / det_safe
-                                inv_blocks[:, 2, 0] = (d * h - e * g) / det_safe
-                                inv_blocks[:, 2, 1] = (b * g - a * h) / det_safe
-                                inv_blocks[:, 2, 2] = (a * e - b * d) / det_safe
-                                cache['inv_blocks'] = inv_blocks
-                            else:
-                                inv_blocks = cache['inv_blocks']
-                                if 'idx' in locals() and idx.size > 0:
-                                    # Recompute only changed rows for idx
-                                    inv_blocks[idx, 0, 0] = (e[idx] * i_[idx] - f[idx] * h[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 0, 1] = (c_[idx] * h[idx] - b[idx] * i_[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 0, 2] = (b[idx] * f[idx] - c_[idx] * e[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 1, 0] = (f[idx] * g[idx] - d[idx] * i_[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 1, 1] = (a[idx] * i_[idx] - c_[idx] * g[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 1, 2] = (c_[idx] * d[idx] - a[idx] * f[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 2, 0] = (d[idx] * h[idx] - e[idx] * g[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 2, 1] = (b[idx] * g[idx] - a[idx] * h[idx]) / det_safe[idx]
-                                    inv_blocks[idx, 2, 2] = (a[idx] * e[idx] - b[idx] * d[idx]) / det_safe[idx]
-
-                            def mv(x):
-                                x_mat = x.reshape((N, 3))
-                                res = cp.zeros_like(x_mat)
-                                # Use cached inv_blocks in-place
-                                for rr in range(3):
-                                    for cc in range(3):
-                                        res[:, rr] += inv_blocks[:, rr, cc] * x_mat[:, cc]
-                                return res.reshape(n_dofs)
-
-                            # Update cached theta only when we recomputed values (full build or partial idx update)
-                            if theta_vec is not None and (do_full_rebuild or (blocks is not None and ('idx' in locals() and idx.size > 0))):
-                                cache['theta_prev'] = theta_vec.copy() if isinstance(theta_vec, cp.ndarray) else cp.asarray(theta_vec)
-
-                            # Create operator once and reuse; else return existing
-                            if cache.get('operator') is None or do_full_rebuild:
-                                if self.cg_verbose:
-                                    print("[cupy][cg][block_jacobi] operator (re)created")
-                                op = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                                cache['operator'] = op
-                            return cache['operator']
-
-                        theta_vec = None
-                        if θ_current is not None:
-                            try:
-                                theta_vec = cp.asarray(θ_current, dtype=cp.float32).ravel()
-                            except Exception:
-                                theta_vec = None
-                        M = create_block_jacobi_preconditioner_interleaved_vectorized(A_gpu, theta_vec)
-                        if self.cg_verbose:
-                            print(f"[cupy][cg] block_jacobi (interleaved) built (N={A_gpu.shape[0]//3})")
-                elif self.preconditioner == 'amg':
-                    # Lightweight approximate AMG: repeated damped Jacobi smoothing as inverse apply.
-                    # Reuse diagonal inverse if sparsity pattern unchanged.
-                    pattern_key = (A_gpu.shape, A_gpu.nnz)
-                    if self._amg_diag_inv is None or self._amg_key != pattern_key:
-                        diag = A_gpu.diagonal()
-                        self._amg_diag_inv = cp.where(diag != 0, 1.0 / diag, 1.0)
-                        self._amg_key = pattern_key
-                    inv_diag = self._amg_diag_inv
-                    base_k = self.amg_smooth_steps
-                    k_eff = base_k
-                    if self.amg_adaptive and self._last_cg_iters is not None and self.cg_max_iter is not None:
-                        frac = self._last_cg_iters / max(1, self.cg_max_iter)
-                        # Reduce smoothing if CG already fast
-                        if frac < 0.25:
-                            k_eff = max(self.amg_min_smooth_steps, base_k - 1)
-                        if frac < 0.10:
-                            k_eff = max(self.amg_min_smooth_steps, base_k - 2)
-                    ω = self.amg_omega
+                elif self.preconditioner == 'legat' and self.have_legate_sparse:
+                    import cupynumeric as cn
+                    diag = A_gpu.diagonal()
+                    inv_diag_cp = cp.where(diag != 0, 1.0 / diag, 1.0)
+                    inv_diag_np = np.asarray(inv_diag_cp.get())
+                    inv_diag_cn = cn.asarray(inv_diag_np)
                     def mv(x):
-                        # Approx solve A y = x starting y=x * diag^{-1} initial guess for quicker convergence.
-                        y = inv_diag * x
-                        for _ in range(k_eff - 1):  # already one implicit pre-smooth in init
-                            r_loc = x - A_gpu @ y
-                            y = y + ω * inv_diag * r_loc
-                        return y
-                    M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                    if self.cg_verbose:
-                        print(f"[cupy][cg] amg approx inverse: k={k_eff} (base={base_k}) ω={ω} last_it={self._last_cg_iters}")
-                elif self.preconditioner == 'legat':
-                    if self.have_legate_sparse:
-                        # Use legate-sparse Jacobi preconditioner
-                        diag = A_gpu.diagonal()
-                        inv_diag_cp = cp.where(diag != 0, 1.0 / diag, 1.0)
-                        inv_diag_np = np.asarray(inv_diag_cp.get())
-                        inv_diag_cn = cn.asarray(inv_diag_np)
-                        def mv(x):
-                            # Convert input to cupynumeric array if needed
-                            x_np = np.asarray(x)
-                            x_cn = cn.asarray(x_np)
-                            return inv_diag_cn * x_cn
-                        M = ls_LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                        if self.cg_verbose:
-                            print(f"[cupy][cg] legate-sparse jacobi preconditioner")
-                    else:
-                        # Fallback to cupy jacobi
-                        diag = A_gpu.diagonal()
-                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
-                        def mv(x):
-                            return inv_diag * x
-                        M = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                        if self.cg_verbose:
-                            print(f"[cupy][cg] cupy jacobi preconditioner (legate-sparse not available)")
-
-                # (3) RHS & warm start
+                        x_np = np.asarray(x)
+                        x_cn = cn.asarray(x_np)
+                        return inv_diag_cn * x_cn
+                    from legate_sparse.linalg import LinearOperator as ls_LinearOperator
+                    M = ls_LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
                 b_gpu = cp.asarray(b)
-
-                # Dimension sanity check before proceeding
-                n_rows = A_gpu.shape[0]
-                if b_gpu.ndim > 1:
-                    b_gpu = b_gpu.ravel()
-                if b_gpu.size != n_rows:
-                    # Provide detailed diagnostics and a helpful hint
-                    msg = (f"[cupy][cg] Dimension mismatch: A rows={n_rows}, b size={b_gpu.size}. "
-                           f"This typically means the load tensor F had unexpected channel count (e.g. 9 instead of 3). "
-                           f"Ensure problem.F shape is (3, Nx, Ny, Nz). If it's (9, ...), select only the displacement DOF loads before solving.")
-                    raise ValueError(msg)
-
-                cache = self._warm_cache.get(phase, {'x': None, 'b': None, 'θ': None})
-
-                x0 = None
-                if self.warm_start and cache['x'] is not None and cache['x'].shape[0] == b_gpu.shape[0]:
-                    allow_theta = True
-                    allow_rhs = True
-
-                    # (a) θ-based gating (mean density change)
-                    if self.warm_strategy in ['theta', 'both'] and θ_current is not None and cache.get('θ') is not None:
-                        try:
-                            θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
-                            θ_prev_gpu = cache['θ']
-                            # Ensure shapes match
-                            if θ_prev_gpu.shape == θ_cur_gpu.shape:
-                                mean_prev = cp.mean(θ_prev_gpu)
-                                mean_cur = cp.mean(θ_cur_gpu)
-                                abs_mean_diff = float(cp.abs(mean_cur - mean_prev))
-                                allow_theta = (abs_mean_diff <= self.warm_theta_tol)
-                                if self.cg_verbose:
-                                    print(f"[cupy][cg] θ mean_change={abs_mean_diff:.3e} tol={self.warm_theta_tol:.1e} allow={allow_theta}")
-                            else:
-                                allow_theta = False
-                        except Exception as e:
-                            allow_theta = False
-                            if self.cg_verbose:
-                                print(f"[cupy][cg] θ gating error: {e}; skipping warm start")
-
-                    # (b) RHS cosine gating (legacy / mostly relevant if b changes)
-                    if self.warm_strategy in ['rhs', 'both'] and cache.get('b') is not None:
-                        bn = cp.linalg.norm(b_gpu)
-                        bln = cp.linalg.norm(cache['b'])
-                        if bn > 0 and bln > 0:
-                            cos_sim = float(cp.dot(b_gpu, cache['b']) / (bn * bln))
-                            allow_rhs = (cos_sim >= self.warm_similarity_threshold)
-                            if self.cg_verbose:
-                                print(f"[cupy][cg] b cos={cos_sim:.3f} thr={self.warm_similarity_threshold} allow={allow_rhs}")
-                        else:
-                            allow_rhs = True  # zero vector; reuse fine
-                    
-                    # Combine
-                    use_warm = False
-                    if self.warm_strategy == 'theta':
-                        use_warm = allow_theta
-                    elif self.warm_strategy == 'rhs':
-                        use_warm = allow_rhs
-                    else:  # both
-                        use_warm = allow_theta and allow_rhs
-
-                    if use_warm:
-                        x0 = cache['x']
-                        if self.cg_verbose:
-                            print(f"[cupy][cg] warm reuse phase={phase} strategy={self.warm_strategy}")
-                    else:
-                        if self.cg_verbose:
-                            print(f"[cupy][cg] warm skip phase={phase} strategy={self.warm_strategy}")
-
-                
                 max_iter = self.cg_max_iter
-                # Heuristic for max_iter if unspecified: 2 * sqrt(n) (rough) capped at 10k
-                # if max_iter is None:
-                #     n = b_gpu.shape[0]
-                #     max_iter = int(min(10000, max(1000, 2 * int(cp.sqrt(n)))))
-
-                start_time = time.time()
-                # Count iterations via callback (cupyx mirrors scipy interface)
                 it_counter = {'k': 0}
                 def _cb(_):
                     it_counter['k'] += 1
-
-                # lu = cupy.sparse.linalg.splu(A_gpu)
-                
-                try:
-                    if self.preconditioner == 'legat' and self.have_legate_sparse:
-                        # Use legate-sparse CG solver
-                        if self.cg_verbose:
-                            print("[legate-sparse][cg] using legate-sparse CG solver")
-                        
-                        # Convert CuPy matrix to legate-sparse format using NumPy directly
-                        data_np = np.asarray(A_gpu.data.get())
-                        indices_np = np.asarray(A_gpu.indices.get()).astype(np.uint64)
-                        indptr_np = np.asarray(A_gpu.indptr.get()).astype(np.uint64)
-                        data_cn = cn.asarray(data_np)
-                        indices_cn = cn.asarray(indices_np, dtype=np.uint64)
-                        indptr_cn = cn.asarray(indptr_np, dtype=np.uint64)
-                        A_ls = ls.csr_matrix((data_cn, indices_cn, indptr_cn), shape=A_gpu.shape)
-
-                        # Convert b and x0 to NumPy arrays
-                        b_np = np.asarray(b_gpu.get(), dtype=np.float64)  # Ensure float64
-                        b_cn = cn.asarray(b_np)
-                        x0_cn = cn.asarray(np.asarray(x0.get())) if x0 is not None else None
-
-                        # Define preconditioner for legate-sparse
-                        if M is not None and hasattr(M, 'matvec'):
-                            def M_ls(x):
-                                x_np = np.asarray(x)
-                                result_np = np.asarray(M.matvec(x_np))
-                                return cn.asarray(result_np)
-                            M_ls_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls, dtype=A_gpu.dtype)
-                        else:
-                            M_ls_op = None
-
-                        # Solve using legate-sparse CG
-                        breakpoint()
-                        x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_op)
-
-                        # Convert result back to NumPy
-                        x_np = np.asarray(x_cn)
-                        x_gpu = cp.asarray(x_np)
-
-                        # Update iteration counter
-                        it_counter['k'] = max_iter if info == 0 else max_iter
-                    else:
-                        # Use CuPy CG solver
-                        x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=x0, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
-                except ValueError as ve:
-                    # Auto-fallback if block_jacobi caused dimensional issue
-                    if self.preconditioner == 'block_jacobi' and 'incompatible dimensions' in str(ve).lower():
-                        if self.cg_verbose:
-                            print("[cupy][cg] fallback: block_jacobi caused dimension error; retrying with scalar jacobi")
-                        diag = A_gpu.diagonal()
-                        inv_diag = cp.where(diag != 0, 1.0 / diag, 1.0)
-                        def mv(x):
-                            return inv_diag * x
-                        M_fallback = LinearOperator(A_gpu.shape, matvec=mv, dtype=A_gpu.dtype)
-                        
-                        if self.preconditioner == 'legat' and self.have_legate_sparse:
-                            # Use legate-sparse CG with fallback preconditioner
-                            data_np = np.asarray(A_gpu.data)
-                            indices_np = np.asarray(A_gpu.indices).astype(np.uint64)
-                            indptr_np = np.asarray(A_gpu.indptr).astype(np.uint64)
-                            data_cn = cn.asarray(data_np)
-                            indices_cn = cn.asarray(indices_np, dtype=np.uint64)
-                            indptr_cn = cn.asarray(indptr_np, dtype=np.uint64)
-                            A_ls = ls.csr_matrix((data_cn, indices_cn, indptr_cn), shape=A_gpu.shape)
-                            b_np = np.asarray(b_gpu)
-                            b_cn = cn.asarray(b_np)
-                            x0_cn = None
-                            def M_ls_fb(x):
-                                # Convert to numpy array using __array__ method via np.asarray
-                                x_np = np.asarray(x)
-                                result_cp = M_fallback.matvec(cp.asarray(x_np))
-                                result_np = np.asarray(result_cp)
-                                return cn.asarray(result_np)
-                            M_ls_fb_op = ls_LinearOperator(A_gpu.shape, matvec=M_ls_fb, dtype=A_gpu.dtype)
-                            x_cn, info = ls_cg(A_ls, b_cn, x0=x0_cn, tol=self.cg_tol, maxiter=max_iter, M=M_ls_fb_op)
-                            x_np = np.asarray(x_cn)
-                            x_gpu = cp.asarray(x_np)
-                            it_counter['k'] = max_iter if info == 0 else max_iter
-                        else:
-                            it_counter = {'k': 0}
-                            def _cb_fb(_):
-                                it_counter['k'] += 1
-                            x_gpu, info = cg_spsolve(A_gpu, b_gpu, x0=None, tol=self.cg_tol, maxiter=max_iter, M=M_fallback, callback=_cb_fb)
-                    else:
-                        raise
+                x_gpu, info = cg_spsolve(A_gpu, b_gpu, tol=self.cg_tol, maxiter=max_iter, M=M, callback=_cb)
                 cp.cuda.get_current_stream().synchronize()
-                elapsed = time.time() - start_time
-
-                if info != 0:
-                    # info > 0 -> convergence not achieved within max_iter, info < 0 -> illegal input
-                    raise RuntimeError(f"[cupy][cg] convergence failed (info={info}) after {elapsed:.3f}s; consider increasing max_iter or relaxing tol.")
-
-                # Cache warm start
-                if self.warm_start:
-                    cache['x'] = x_gpu
-                    cache['b'] = b_gpu if self.warm_strategy in ['rhs', 'both'] else cache.get('b')
-                    if θ_current is not None and self.warm_strategy in ['theta', 'both']:
-                        try:
-                            cache['θ'] = cp.asarray(θ_current, dtype=cp.float32)
-                        except Exception:
-                            cache['θ'] = cache.get('θ')  # keep old if failure
-                    self._warm_cache[phase] = cache
-
-                # Store last iterations (info==0 -> success) using counter if available
-                if isinstance(it_counter.get('k'), int) and it_counter['k'] > 0:
-                    self._last_cg_iters = it_counter['k']
-                elif isinstance(info, int) and info > 0:
-                    self._last_cg_iters = info
-                else:
-                    self._last_cg_iters = None
-                if self.cg_verbose:
-                    it_disp = self._last_cg_iters if self._last_cg_iters is not None else 'NA'
-                    print(f"[cupy][cg] phase={phase} n={b_gpu.shape[0]} time={elapsed:.3f}s tol={self.cg_tol} it={it_disp} warm={'y' if x0 is not None else 'n'} prec={self.preconditioner}")
-
-                # Auto-freeze/unfreeze policy for block_jacobi value updates
-                if self.preconditioner == 'block_jacobi' and self.bj_freeze_enabled:
-                    st = self._bj_freeze_state
-                    # Track theta stability over time
-                    if θ_current is not None:
-                        try:
-                            θ_cur_gpu = cp.asarray(θ_current, dtype=cp.float32)
-                            cur_mean = float(np.asarray(cp.mean(θ_cur_gpu)))
-                            if st['prev_mean'] is None:
-                                st['prev_mean'] = cur_mean
-                            dmean = abs(cur_mean - st['prev_mean'])
-                            if dmean <= self.bj_freeze_theta_tol:
-                                st['stable_steps'] = int(st.get('stable_steps', 0)) + 1
-                            else:
-                                st['stable_steps'] = 0
-                            st['prev_mean'] = cur_mean
-                        except Exception:
-                            pass
-                    # Freeze when stable enough and not already frozen
-                    if (not st.get('frozen', False)) and st.get('stable_steps', 0) >= self.bj_freeze_patience:
-                        st['frozen'] = True
-                        st['baseline_iters'] = self._last_cg_iters if isinstance(self._last_cg_iters, int) else st.get('baseline_iters')
-                        if self.cg_verbose:
-                            print(f"[cupy][cg][block_jacobi] auto-freeze: stable_steps={st['stable_steps']} baseline_iters={st['baseline_iters']}")
-                    # Unfreeze if iteration count jumps too much
-                    if st.get('frozen', False) and st.get('baseline_iters') is not None and isinstance(self._last_cg_iters, int):
-                        if self._last_cg_iters > st['baseline_iters'] * self.bj_unfreeze_iter_jump:
-                            st['frozen'] = False
-                            st['stable_steps'] = 0
-                            st['baseline_iters'] = None
-                            if self.cg_verbose:
-                                print(f"[cupy][cg][block_jacobi] auto-unfreeze: iters jumped {self._last_cg_iters} > {self.bj_unfreeze_iter_jump}× baseline")
-
                 return cp.asnumpy(x_gpu)
-                
-            return solve_gpu
-        # CPU solver (iterative / direct depending on config)
-        if self.preconditioner in ['lu', 'splu']:
-            # Direct CPU sparse solve; use SuperLU explicitly for 'splu'
-            from scipy.sparse.linalg import splu as scipy_splu
-            def solve_cpu_direct(A, b, phase='forward', θ_current=None):
-                start_time = time.time()
-                if self.preconditioner == 'splu':
-                    x = scipy_splu(A.tocsc()).solve(b)
-                    method = 'splu'
-                else:
-                    x = spsolve(A, b, use_umfpack=self.use_umfpack)
-                    method = 'spsolve'
-                if self.cg_verbose:
-                    print(f"[cpu][{method}] phase={phase} n={A.shape[0]} time={time.time()-start_time:.3f}s")
-                return x
-            return solve_cpu_direct
-        if self.preconditioner == 'amg':
-            def solve_cpu_amg(A, b, phase='forward', θ_current=None):
-                # Key by shape + nnz; if nnz unchanged assume pattern stable
-                key = (A.shape, A.nnz)
-                build = (self._amg_hierarchy is None) or (self._amg_key != key)
-                if build:
-                    if self.cg_verbose:
-                        print(f"[amg] building hierarchy shape={A.shape} nnz={A.nnz}")
-                    self._amg_hierarchy = pyamg.smoothed_aggregation_solver(A.tocsr())
-                    self._amg_key = key
-                # Use acceleration 'cg' with target tolerance (may differ from pyamg's internal default)
-                x = self._amg_hierarchy.solve(b, tol=self.cg_tol, accel='cg')
-                if self.cg_verbose:
-                    print(f"[amg] solve phase={phase} tol={self.cg_tol}")
-                return x
-            return solve_cpu_amg
-        # Default CPU direct solve
-        return lambda A, b, phase='forward', θ_current=None: spsolve(A, b, use_umfpack=self.use_umfpack)
+            return solve_gpu_cupy
+
+        if self.optimizer == "legate" and self.have_legate_sparse:
+            import cupynumeric as cn
+            import numpy as np
+            from legate_sparse import csr_matrix
+            from legate_sparse.linalg import cg as ls_cg, LinearOperator as ls_LinearOperator
+            def solve_gpu_legate(A, b, phase='forward', θ_current=None):
+                # Convert to cupynumeric arrays
+                data_cn = cn.asarray(np.asarray(A.data, dtype=np.float64))
+                indices_cn = cn.asarray(np.asarray(A.indices, dtype=np.uint64))
+                indptr_cn = cn.asarray(np.asarray(A.indptr, dtype=np.uint64))
+                A_ls = csr_matrix((data_cn, indices_cn, indptr_cn), shape=A.shape)
+                b_cn = cn.asarray(np.asarray(b, dtype=np.float64))
+                M = None
+                if self.preconditioner == 'jacobi':
+                    diag = np.asarray(A.diagonal(), dtype=np.float64)
+                    inv_diag = np.where(diag != 0, 1.0 / diag, 1.0)
+                    inv_diag_cn = cn.asarray(inv_diag)
+                    def mv(x):
+                        return inv_diag_cn * x
+                    M = ls_LinearOperator(A.shape, matvec=mv, dtype=np.float64)
+                x_cn, info = ls_cg(A_ls, b_cn, tol=self.cg_tol, maxiter=self.cg_max_iter, M=M)
+                return np.asarray(x_cn)
+            return solve_gpu_legate
+
+        # Default: CPU (scipy)
+        def solve_cpu(A, b, phase='forward', θ_current=None):
+            from scipy.sparse.linalg import spsolve
+            return spsolve(A, b, use_umfpack=self.use_umfpack)
+        return solve_cpu
+
 
 # Internal Cell
 import copy
@@ -1054,7 +325,7 @@ class PDESolver:
 
 
     def __call__(self,
-                 solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
+                 solution, # The solution for which the PDE should be solved.
                  p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
                  binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
                 ):
@@ -1065,7 +336,7 @@ class PDESolver:
 
 
     def solve_pde(self,
-                 solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
+                 solution, # The solution for which the PDE should be solved.
                  p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
                  binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
                 ):
@@ -1531,7 +802,7 @@ class UnpaddedFDM(PDESolver):
 
 
     def assemble_tensors(self,
-                         problem:"dl4to.problem.Problem" # The problem for which the tensors should be assembled.
+                         problem # The problem for which the tensors should be assembled.
                         ):
         """
         Assembles all FDM tensors from the problem object that can be pre-built without knowledge of the density distribution `θ`. This may take some time but makes future PDE evaluations for this problem much faster.
