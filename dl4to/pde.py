@@ -5,14 +5,9 @@ __all__ = [
     'FDMDerivatives', 'FDMAdjointDerivatives', 'FDMAssembly', 'UnpaddedFDM', 'FDM',
     'configure_legion_memory'
 ]
-
-import os
-import time
-import warnings
 from typing import Callable
-import numpy as np
-import torch
 from scipy.sparse.linalg import spsolve
+import torch, numpy as np, os, copy  # added required imports
 
 # Optional backend availability flags
 try:
@@ -32,6 +27,9 @@ try:
     HAVE_PYAMGX = True
 except Exception:
     HAVE_PYAMGX = False
+
+# Global singleton for MFEM device to avoid reconfiguration aborts
+_MFEM_DEVICE_SINGLETON = None
 
 
 def configure_legion_memory(replheap_size_mb: int = 64):
@@ -112,98 +110,57 @@ class SparseLinearSolver(LinearSolver):
     def _backend(self):
         opt = self.optimizer
 
-        # --- MFEM distributed backend ---
+        # --- MFEM distributed backend (minimal GPU init) ---
         if opt == 'mfem':
             try:
-                from mpi4py import MPI
+                from mpi4py import MPI  # noqa: F401
                 import mfem.par as mfem
                 from mfem.common.parcsr_extra import ToHypreParCSR, ToHypreParVec, HypreVec2Array
+                global _MFEM_DEVICE_SINGLETON
+                if _MFEM_DEVICE_SINGLETON is None:
+                    # First-time device setup
+                    try:
+                        _MFEM_DEVICE_SINGLETON = mfem.Device('cuda')
+                    except Exception:
+                        _MFEM_DEVICE_SINGLETON = mfem.Device('cpu')
+                else:
+                    # Reuse previously configured device (calling constructor again with a backend triggers abort)
+                    pass
+                dev = _MFEM_DEVICE_SINGLETON
+                backend = dev.GetDeviceMemoryClass()
+                if MPI.COMM_WORLD.rank == 0:
+                    memclass_names = {0: 'HOST', 1: 'HOST_OWNED', 2: 'DEVICE', 3: 'MANAGED'}
+                    print(f"[mfem] Device backend: {backend} ({memclass_names.get(backend,'?')})")
+                def solve_mfem_hypre(A, b, phase='forward', θ_current=None):
+                    if A.format != 'csr':
+                        A_csr = A.tocsr()
+                    else:
+                        A_csr = A
+                    A_par = ToHypreParCSR(A_csr)
+                    B = ToHypreParVec(b)
+                    X = mfem.HypreParVector(A_par, 0)
+                    X.Assign(0.0)
+                    amg = mfem.HypreBoomerAMG(A_par)
+                    amg.SetPrintLevel(0)
+                    pcg = mfem.HyprePCG(A_par)
+                    pcg.SetTol(self.cg_tol)
+                    if self.cg_max_iter is not None:
+                        pcg.SetMaxIter(self.cg_max_iter)
+                    pcg.SetPrintLevel(2)
+                    pcg.SetPreconditioner(amg)
+                    pcg.Mult(B, X)
+                    try:
+                        X.HostRead()
+                    except Exception:
+                        pass
+                    x_np = HypreVec2Array(X)
+                    if x_np is None:
+                        x_np = np.array([X[i] for i in range(B.Size())], dtype=np.float64)
+                    return x_np
+                return solve_mfem_hypre
             except Exception as e:
-                warnings.warn(f"MFEM unavailable ({e}); falling back to scipy")
-            else:
-                comm = MPI.COMM_WORLD
-                rank = comm.rank
-                size = comm.size
-
-                def solve_mfem(A, b, phase='forward', θ_current=None):
-                    A_csr = A.tocsr(); N = A_csr.shape[0]
-                    cache = self._mfem_dist_cache
-                    if not (cache and cache.get('N') == N):
-                        if rank == 0:
-                            try:
-                                import pymetis
-                                use_metis = (size > 1)
-                            except Exception:
-                                use_metis = False
-                            if use_metis:
-                                pat = (A_csr != 0).astype(np.int8)
-                                patT = pat.transpose(); pat_sym = pat + patT
-                                pat_sym.data[:] = 1; pat_sym.eliminate_zeros()
-                                indptr = pat_sym.indptr.astype(np.int32, copy=False)
-                                indices = pat_sym.indices.astype(np.int32, copy=False)
-                                _, parts = pymetis.part_graph(size, xadj=indptr, adjncy=indices)
-                                parts = np.asarray(parts, dtype=np.int32)
-                                order = np.argsort(parts, kind='stable')
-                                perm = order
-                                perm_inv = np.empty_like(perm); perm_inv[perm] = np.arange(N)
-                                counts = [(parts == p).sum() for p in range(size)]
-                                row_starts = [0]
-                                for c in counts: row_starts.append(row_starts[-1] + c)
-                                metis_used = True
-                            else:
-                                perm = np.arange(N, dtype=np.int64)
-                                perm_inv = perm.copy()
-                                base = N // size; extra = N % size
-                                row_starts = [0]
-                                for r in range(size):
-                                    nloc = base + (1 if r < extra else 0)
-                                    row_starts.append(row_starts[-1] + nloc)
-                                metis_used = False
-                            meta = {'N': N, 'perm': perm, 'perm_inv': perm_inv, 'row_starts': row_starts, 'metis_used': metis_used}
-                        else:
-                            meta = None
-                        meta = comm.bcast(meta, root=0)
-                        self._mfem_dist_cache = meta; cache = meta
-                    perm = cache['perm']; row_starts = cache['row_starts']; metis_used = cache['metis_used']
-                    if size > 1:
-                        if rank == 0:
-                            A_perm = A_csr[perm, :][:, perm]
-                            b_perm = b[perm]
-                            data, indices, indptr = A_perm.data, A_perm.indices, A_perm.indptr
-                        else:
-                            data = indices = indptr = b_perm = None
-                        data = comm.bcast(data, root=0); indices = comm.bcast(indices, root=0); indptr = comm.bcast(indptr, root=0)
-                        b_perm = comm.bcast(b_perm, root=0)
-                        from scipy.sparse import csr_matrix as _csr
-                        A_perm = _csr((data, indices, indptr), shape=A_csr.shape)
-                    else:
-                        A_perm = A_csr; b_perm = b
-                    r0 = row_starts[rank]; r1 = row_starts[rank+1]
-                    A_loc = A_perm[r0:r1]; b_loc = b_perm[r0:r1]
-                    A_par = ToHypreParCSR(A_loc); B_par = ToHypreParVec(b_loc)
-                    X_par = mfem.HypreParVector(A_par, 0); X_par.Assign(0.0)
-                    amg = mfem.HypreBoomerAMG(A_par); amg.SetPrintLevel(0)
-                    pcg = mfem.HyprePCG(A_par); pcg.SetTol(self.cg_tol)
-                    if self.cg_max_iter is not None: pcg.SetMaxIter(self.cg_max_iter)
-                    pcg.SetPrintLevel(0); pcg.SetPreconditioner(amg); pcg.Mult(B_par, X_par)
-                    try: X_par.HostRead()
-                    except Exception: pass
-                    from mfem.common.parcsr_extra import HypreVec2Array
-                    x_loc = HypreVec2Array(X_par)
-                    if rank == 0:
-                        full = np.empty(N, dtype=np.float64); full[r0:r1] = x_loc
-                        for src in range(1, size):
-                            s0 = row_starts[src]; s1 = row_starts[src+1]
-                            recv = comm.recv(source=src, tag=901); full[s0:s1] = recv
-                        if metis_used:
-                            out = np.empty_like(full); out[perm] = full
-                        else:
-                            out = full
-                    else:
-                        comm.send(x_loc, dest=0, tag=901); out = None
-                    out = comm.bcast(out, root=0)
-                    return out
-                return solve_mfem
+                print(f"[mfem] backend init failed -> falling back to scipy ({e})")
+                # continue to default path
 
         # --- AMGX ---
         if opt == 'amgx' and HAVE_PYAMGX:
