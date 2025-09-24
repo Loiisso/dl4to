@@ -40,34 +40,68 @@ def configure_legion_memory(replheap_size_mb: int = 64):
 class AutogradLinearSolver(torch.autograd.Function):
     @staticmethod
     def forward(ctx, θ, A_op, b, solver, A_mat, factorize=True):
+        """
+        In the forward pass we receive a tensor containing the input and return
+        a tensor containing the output. `ctx` is a context object that can be used
+        to stash information for backward computation. You can cache arbitrary
+        objects for use in the backward pass using the `ctx.save_for_backward` method.
+
+        Returns
+        torch.Tensor
+        """
         np_b = b.cpu().numpy()
+        # Explicit phase label
+        phase = 'forward'
+
         if factorize:
-            # Factorization path (not typically used with iterative GPU solvers)
-            from scipy.sparse.linalg import factorized
-            solve_fn = factorized(A_mat)
-            x_np = solve_fn(np_b)
+            solver = factorized(A_mat)
+            x = solver(np_b)
         else:
-            x_np = solver(A_mat, np_b)
-        x = torch.from_numpy(x_np.astype(np_b.dtype))
+            # pass phase explicitly and include θ for warm-start gating if solver supports it
+            try:
+                x = solver(A_mat, np_b, phase=phase, θ_current=θ.detach().cpu().numpy())
+            except TypeError:
+                # Backward compatibility if older signature
+                x = solver(A_mat, np_b, phase=phase)
+
+        x = torch.from_numpy(x.astype(np_b.dtype))
         ctx.save_for_backward(θ, x, b)
         ctx.intermediate = (A_mat, solver, A_op, factorize)
         return x
 
+
     @staticmethod
     def backward(ctx, grad_output):
+        """
+        In the backward pass we receive a tensor containing the gradient of the loss
+        with respect to the output, and we need to compute the gradient of the loss
+        with respect to the input.
+
+        Returns
+        ----------
+        (torch.Tensor, None, None, None, None, None)
+        """
+        torch.set_grad_enabled(True)
         θ, x, b = ctx.saved_tensors
         A_mat, solver, A_op, factorize = ctx.intermediate
-        θ = θ.clone().detach(); θ.requires_grad_(True)
+        θ = θ.clone().detach()
+        θ.requires_grad_(True)
+
         with torch.no_grad():
-            g_np = grad_output.flatten().cpu().numpy()
+            phase = 'adjoint'
+            flat_np_grad_output = grad_output.flatten().cpu().numpy()
+
             if factorize:
-                from scipy.sparse.linalg import factorized
-                solve_fn = factorized(A_mat)
-                y_np = solve_fn(g_np)
+                y = solver(flat_np_grad_output)
             else:
-                y_np = solver(A_mat, g_np)
-            y = torch.from_numpy(y_np).clone()
-            x = x.clone()
+                try:
+                    y = solver(A_mat, flat_np_grad_output, phase=phase, θ_current=θ.detach().cpu().numpy())
+                except TypeError:
+                    y = solver(A_mat, flat_np_grad_output, phase=phase)
+
+            y = torch.from_numpy(y).clone().requires_grad_(False)
+            x = x.clone().requires_grad_(False)
+
         expr = torch.sum(y * (b - A_op(x, θ).flatten()))
         grad_input = torch.autograd.grad(expr, θ)
         return grad_input[0], None, None, None, None, None
