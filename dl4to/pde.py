@@ -7,7 +7,18 @@ __all__ = [
 ]
 from typing import Callable
 from scipy.sparse.linalg import spsolve
+from scipy.sparse import csr_matrix
 import torch, numpy as np, os, copy  # added required imports
+import multiprocessing as mp
+from multiprocessing.managers import SyncManager
+import socket
+import uuid
+import time
+from queue import Empty
+try:
+    from scikits.umfpack import factorized
+except ImportError:
+    from scipy.sparse.linalg import factorized
 
 # Optional backend availability flags
 try:
@@ -15,6 +26,7 @@ try:
     HAVE_CUPY = torch.cuda.is_available()
 except Exception:
     HAVE_CUPY = False
+
 
 try:
     import legate_sparse  # noqa: F401
@@ -121,20 +133,19 @@ class LinearSolver:
 
 class SparseLinearSolver(LinearSolver):
     def __init__(self,
-                 optimizer: str = 'scipy',
-                 use_umfpack: bool = True,
-                 factorize: bool = False,
-                 cg_tol: float = 1e-6,
-                 cg_max_iter: int | None = None,
-                 preconditioner: str = 'jacobi',  # 'none' | 'jacobi' | 'legat'
-                 amgx_config: dict | None = None):
+                optimizer: str = 'scipy',
+                use_umfpack: bool = True,
+                factorize: bool = False,
+                cg_tol: float = 1e-6,
+                cg_max_iter: int | None = None,
+                preconditioner: str = 'jacobi',  # 'none' | 'jacobi' | 'legat'
+                amgx_config: dict | None = None):
         self.optimizer = optimizer.lower()
         self.use_umfpack = use_umfpack
         self.cg_tol = cg_tol
         self.cg_max_iter = cg_max_iter
         self.preconditioner = preconditioner.lower()
         self.amgx_config = amgx_config
-        self._mfem_dist_cache = None  # {'N','perm','perm_inv','row_starts','metis_used'}
         super().__init__(factorize=factorize)
 
     # Public name retained for compatibility with earlier code
@@ -144,57 +155,76 @@ class SparseLinearSolver(LinearSolver):
     def _backend(self):
         opt = self.optimizer
 
-        # --- MFEM distributed backend (minimal GPU init) ---
+        # --- MFEM distributed backend (with optional PyMETIS partition) ---
         if opt == 'mfem':
-            try:
-                from mpi4py import MPI  # noqa: F401
-                import mfem.par as mfem
-                from mfem.common.parcsr_extra import ToHypreParCSR, ToHypreParVec, HypreVec2Array
-                global _MFEM_DEVICE_SINGLETON
-                if _MFEM_DEVICE_SINGLETON is None:
-                    # First-time device setup
-                    try:
-                        _MFEM_DEVICE_SINGLETON = mfem.Device('cuda')
-                    except Exception:
-                        _MFEM_DEVICE_SINGLETON = mfem.Device('cpu')
-                else:
-                    # Reuse previously configured device (calling constructor again with a backend triggers abort)
-                    pass
-                dev = _MFEM_DEVICE_SINGLETON
-                backend = dev.GetDeviceMemoryClass()
-                if MPI.COMM_WORLD.rank == 0:
-                    memclass_names = {0: 'HOST', 1: 'HOST_OWNED', 2: 'DEVICE', 3: 'MANAGED'}
-                    print(f"[mfem] Device backend: {backend} ({memclass_names.get(backend,'?')})")
-                def solve_mfem_hypre(A, b, phase='forward', θ_current=None):
-                    if A.format != 'csr':
-                        A_csr = A.tocsr()
-                    else:
-                        A_csr = A
-                    A_par = ToHypreParCSR(A_csr)
-                    B = ToHypreParVec(b)
-                    X = mfem.HypreParVector(A_par, 0)
-                    X.Assign(0.0)
-                    amg = mfem.HypreBoomerAMG(A_par)
-                    amg.SetPrintLevel(0)
-                    pcg = mfem.HyprePCG(A_par)
-                    pcg.SetTol(self.cg_tol)
-                    if self.cg_max_iter is not None:
-                        pcg.SetMaxIter(self.cg_max_iter)
-                    pcg.SetPrintLevel(2)
-                    pcg.SetPreconditioner(amg)
-                    pcg.Mult(B, X)
-                    try:
-                        X.HostRead()
-                    except Exception:
+            def solve_mfem_remote(A, b, phase='forward', θ_current=None):
+                """
+                Remote MFEM solver using client-server architecture.
+                Connects to mfem_solver_process.py via SyncManager queues.
+                """
+                try:
+                    # Connect to MFEM solver server
+                    port = 50000
+                    authkey = b'mfem_solver'
+                    
+                    class QueueManager(SyncManager):
                         pass
-                    x_np = HypreVec2Array(X)
-                    if x_np is None:
-                        x_np = np.array([X[i] for i in range(B.Size())], dtype=np.float64)
-                    return x_np
-                return solve_mfem_hypre
-            except Exception as e:
-                print(f"[mfem] backend init failed -> falling back to scipy ({e})")
-                # continue to default path
+                    
+                    QueueManager.register('get_input_queue')
+                    QueueManager.register('get_output_queue')
+                    
+                    try:
+                        manager = QueueManager(address=('localhost', port), authkey=authkey)
+                        manager.connect()
+                        input_queue = manager.get_input_queue()
+                        output_queue = manager.get_output_queue()
+                    except (ConnectionRefusedError, socket.error) as e:
+                        raise ValueError(f"[mfem] Failed to connect to server on port {port}: {e}")
+                    
+                        
+                    
+                    # Convert matrix to CSR format for serialization
+                    A_csr = A.tocsr() if hasattr(A, 'tocsr') else csr_matrix(A)
+                    if A_csr.dtype != np.float64:
+                        A_csr = A_csr.astype(np.float64)
+                    
+                    b_np = np.asarray(b, dtype=np.float64).reshape(-1)
+                    
+                    # Generate unique request ID
+                    request_id = str(uuid.uuid4())
+                    
+                    # Send request to server
+                    data = (A_csr.data, A_csr.indices, A_csr.indptr, A_csr.shape, b_np, request_id)
+                    input_queue.put(data)
+                    
+                    # Wait for response with timeout
+                    start_time = time.time()
+                    timeout = 900  # 15 minutes
+                    
+                    while True:
+                        try:
+                            result = output_queue.get(timeout=1.0)
+                            if len(result) == 3:  # Error case
+                                x, req_id, error = result
+                                if req_id == request_id:
+                                    print(f"[mfem] Server error: {error}")
+                                    print("[mfem] Falling back to scipy solver")
+                                    return spsolve(A, b)
+                            else:  # Success case
+                                x, req_id = result
+                                if req_id == request_id:
+                                    return x
+                        except Empty:
+                            if time.time() - start_time > timeout:
+                                print("[mfem] Timeout waiting for server response")
+                                print("[mfem] Falling back to scipy solver")
+                                return spsolve(A, b)
+                            continue
+                            
+                except Exception as e:
+                    raise ValueError(f"[mfem] Remote solver failed: {e}")
+                    
+            return solve_mfem_remote
 
         # --- AMGX ---
         if opt == 'amgx' and HAVE_PYAMGX:
@@ -276,15 +306,15 @@ class PDESolver:
     A parent class that inherits all PDE solvers.
     """
     def __init__(self,
-                 assemble_tensors_when_passed_to_problem:bool=False # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
+                assemble_tensors_when_passed_to_problem:bool=False # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
                 ):
         self.assemble_tensors_when_passed_to_problem = assemble_tensors_when_passed_to_problem
 
 
     def __call__(self,
-                 solution, # The solution for which the PDE should be solved.
-                 p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                 binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
+                solution, # The solution for which the PDE should be solved.
+                p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
+                binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
                 ):
         """
         Does the same as the `solve_pde` method. Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
@@ -293,9 +323,9 @@ class PDESolver:
 
 
     def solve_pde(self,
-                 solution, # The solution for which the PDE should be solved.
-                 p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                 binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
+                solution, # The solution for which the PDE should be solved.
+                p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
+                binary:bool=False # Whether the densities in the solution should be binarized before solving the PDE.
                 ):
         """
         Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
@@ -544,7 +574,6 @@ class FDMAdjointDerivatives():
 import torch
 import numpy as np
 from scipy.sparse import csc_matrix, hstack
-import time
 
 # Cell
 class FDMAssembly():
@@ -705,9 +734,9 @@ class UnpaddedFDM(PDESolver):
     A PDE solver for linear elasticity that uses the finite differences method (FDM) with padding.
     """
     def __init__(self, θ_min:float=1e-6, # The minimal value in the stiffness matrix. For numerical reasons we can not allow 0s, since they may lead to singular matrices.
-                 use_forward_differences:bool=True, # Whether to use forward differences or central differences.
-                 assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
-                 ):
+                use_forward_differences:bool=True, # Whether to use forward differences or central differences.
+                assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
+                ):
         self._θ_min = θ_min
         # Use iterative solver (factorize=False) to allow θ-based warm-start gating & GPU path
         # Use a conservative default backend (scipy). User can override later.
@@ -758,7 +787,7 @@ class UnpaddedFDM(PDESolver):
 
 
     def assemble_tensors(self,
-                         problem # The problem for which the tensors should be assembled.
+                        problem # The problem for which the tensors should be assembled.
                         ):
         """
         Assembles all FDM tensors from the problem object that can be pre-built without knowledge of the density distribution `θ`. This may take some time but makes future PDE evaluations for this problem much faster.
@@ -798,8 +827,8 @@ class UnpaddedFDM(PDESolver):
 
     def _J_adj(self, σ, dirichlet=False):
         Jt = lambda σ: FDMAdjointDerivatives.du_dx_adj(σ[:3],  self.h, self.use_forward_differences) + \
-                       FDMAdjointDerivatives.du_dy_adj(σ[3:6], self.h, self.use_forward_differences) + \
-                       FDMAdjointDerivatives.du_dz_adj(σ[6:],  self.h, self.use_forward_differences)
+                    FDMAdjointDerivatives.du_dy_adj(σ[3:6], self.h, self.use_forward_differences) + \
+                    FDMAdjointDerivatives.du_dz_adj(σ[6:],  self.h, self.use_forward_differences)
 
         if dirichlet:
             return FDMAssembly.apply_dirichlet_zero_rows_to_operator(Jt, self.Ω_dirichlet)(σ)
@@ -940,10 +969,10 @@ class UnpaddedFDM(PDESolver):
 
 
     def solve_pde(self,
-                 solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
-                 p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                 binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
-                 get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
+                solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
+                p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
+                binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
+                get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
                 ):
         """
         Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
@@ -962,9 +991,9 @@ class FDM(UnpaddedFDM):
     A PDE solver for linear elasticity that uses the finite differences method (FDM) with padding.
     """
     def __init__(self, θ_min:float=1e-6, # The minimal value in the stiffness matrix. For numerical reasons we can not allow 0s, since they may lead to singular matrices.
-                 use_forward_differences:bool=True, # Whether to use forward differences or central differences.
-                 assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
-                 padding_depth:int=0 # The depth of the padding surrounding the design space. In some cases, it is recommended to increase the padding depth to 2 to improve results but also increase running time.
+                use_forward_differences:bool=True, # Whether to use forward differences or central differences.
+                assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
+                padding_depth:int=0 # The depth of the padding surrounding the design space. In some cases, it is recommended to increase the padding depth to 2 to improve results but also increase running time.
                 ):
         self.padding_depth = padding_depth
         super().__init__(
@@ -1054,10 +1083,10 @@ class FDM(UnpaddedFDM):
 
 
     def solve_pde(self,
-                 solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
-                 p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                 binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
-                 get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
+                solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
+                p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
+                binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
+                get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
                 ):
         """
         Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
