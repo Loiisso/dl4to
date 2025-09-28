@@ -43,6 +43,12 @@ except Exception:
 # Global singleton for MFEM device to avoid reconfiguration aborts
 _MFEM_DEVICE_SINGLETON = None
 
+# Lightweight cache for MFEM SyncManager connection/proxies to avoid reconnect per call
+_MFEM_Q_MANAGER = None
+_MFEM_Q_INPUT = None
+_MFEM_Q_OUTPUT = None
+_MFEM_Q_ADDR = None  # tuple (host, port)
+
 
 def configure_legion_memory(replheap_size_mb: int = 64):
     """Set Legion replheap size (helpful for legate-sparse)."""
@@ -163,6 +169,9 @@ class SparseLinearSolver(LinearSolver):
                 Connects to mfem_solver_process.py via SyncManager queues.
                 """
                 try:
+                    # Minimal, opt-in client-side comm profiling
+                    _prof = os.getenv("MFEM_COMM_PROFILE", "0") == "1"
+
                     # Connect to MFEM solver server
                     port = 50000
                     authkey = b'mfem_solver'
@@ -172,14 +181,31 @@ class SparseLinearSolver(LinearSolver):
                     
                     QueueManager.register('get_input_queue')
                     QueueManager.register('get_output_queue')
-                    
-                    try:
-                        manager = QueueManager(address=('localhost', port), authkey=authkey)
-                        manager.connect()
-                        input_queue = manager.get_input_queue()
-                        output_queue = manager.get_output_queue()
-                    except (ConnectionRefusedError, socket.error) as e:
-                        raise ValueError(f"[mfem] Failed to connect to server on port {port}: {e}")
+
+                    # Reuse existing connection if available and same address
+                    global _MFEM_Q_MANAGER, _MFEM_Q_INPUT, _MFEM_Q_OUTPUT, _MFEM_Q_ADDR
+                    if _MFEM_Q_MANAGER is None or _MFEM_Q_ADDR != ('localhost', port):
+                        try:
+                            _t0 = time.time()
+                            manager = QueueManager(address=('localhost', port), authkey=authkey)
+                            manager.connect()
+                            input_queue = manager.get_input_queue()
+                            output_queue = manager.get_output_queue()
+                            # cache
+                            _MFEM_Q_MANAGER = manager
+                            _MFEM_Q_INPUT = input_queue
+                            _MFEM_Q_OUTPUT = output_queue
+                            _MFEM_Q_ADDR = ('localhost', port)
+                            if _prof:
+                                _connect_ms = (time.time() - _t0) * 1000.0
+                                print(f"[mfem-comm] connect_ms={_connect_ms:.2f}", flush=True)
+                        except (ConnectionRefusedError, socket.error) as e:
+                            raise ValueError(f"[mfem] Failed to connect to server on port {port}: {e}")
+                    else:
+                        input_queue = _MFEM_Q_INPUT
+                        output_queue = _MFEM_Q_OUTPUT
+                        if _prof:
+                            print("[mfem-comm] reused_conn=1", flush=True)
                     
                         
                     
@@ -187,18 +213,31 @@ class SparseLinearSolver(LinearSolver):
                     A_csr = A.tocsr() if hasattr(A, 'tocsr') else csr_matrix(A)
                     if A_csr.dtype != np.float64:
                         A_csr = A_csr.astype(np.float64)
+                    # Reduce payload size: ensure index arrays are int32 (common SciPy default, half the bytes vs int64)
+                    indices_i32 = np.asarray(A_csr.indices, dtype=np.int32)
+                    indptr_i32 = np.asarray(A_csr.indptr, dtype=np.int32)
                     
                     b_np = np.asarray(b, dtype=np.float64).reshape(-1)
                     
+                    # Estimate bytes to send (dominant payload only)
+                    if _prof:
+                        _bytes_in = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
+
                     # Generate unique request ID
                     request_id = str(uuid.uuid4())
                     
-                    # Send request to server
-                    data = (A_csr.data, A_csr.indices, A_csr.indptr, A_csr.shape, b_np, request_id)
+                    # Send request to server (include phase for preconditioner caching)
+                    data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
+                    if _prof:
+                        _t_put0 = time.time()
                     input_queue.put(data)
+                    if _prof:
+                        _put_ms = (time.time() - _t_put0) * 1000.0
                     
                     # Wait for response with timeout
                     start_time = time.time()
+                    if _prof:
+                        _t_wait0 = start_time
                     timeout = 900  # 15 minutes
                     
                     while True:
@@ -207,18 +246,23 @@ class SparseLinearSolver(LinearSolver):
                             if len(result) == 3:  # Error case
                                 x, req_id, error = result
                                 if req_id == request_id:
-                                    print(f"[mfem] Server error: {error}")
-                                    print("[mfem] Falling back to scipy solver")
-                                    return spsolve(A, b)
+                                    raise ValueError(f"[mfem] Server error: {error}")
                             else:  # Success case
                                 x, req_id = result
                                 if req_id == request_id:
+                                    if _prof:
+                                        _wait_ms = (time.time() - _t_wait0) * 1000.0
+                                        x_arr = np.asarray(x)
+                                        _bytes_out = int(x_arr.nbytes)
+                                        print(
+                                            f"[mfem-comm] bytes_in={_bytes_in} put_ms={_put_ms:.2f} "
+                                            f"wait_ms={_wait_ms:.2f} bytes_out={_bytes_out}",
+                                            flush=True,
+                                        )
                                     return x
                         except Empty:
                             if time.time() - start_time > timeout:
-                                print("[mfem] Timeout waiting for server response")
-                                print("[mfem] Falling back to scipy solver")
-                                return spsolve(A, b)
+                                raise ValueError("[mfem] Timeout waiting for server response")
                             continue
                             
                 except Exception as e:
