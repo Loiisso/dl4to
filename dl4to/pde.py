@@ -139,19 +139,21 @@ class LinearSolver:
 
 class SparseLinearSolver(LinearSolver):
     def __init__(self,
-                optimizer: str = 'scipy',
-                use_umfpack: bool = True,
-                factorize: bool = False,
-                cg_tol: float = 1e-6,
-                cg_max_iter: int | None = None,
-                preconditioner: str = 'jacobi',  # 'none' | 'jacobi' | 'legat'
-                amgx_config: dict | None = None):
+                 optimizer: str = 'scipy',
+                 use_umfpack: bool = True,
+                 factorize: bool = False,
+                 cg_tol: float = 1e-6,
+                 cg_max_iter: int | None = None,
+                 preconditioner: str = 'jacobi',  # 'none' | 'jacobi' | 'legat'
+                 amgx_config: dict | None = None):
         self.optimizer = optimizer.lower()
         self.use_umfpack = use_umfpack
         self.cg_tol = cg_tol
         self.cg_max_iter = cg_max_iter
         self.preconditioner = preconditioner.lower()
         self.amgx_config = amgx_config
+        # Optional initial guess for iterative solvers (used by 'mfem' backend)
+        self.initial_guess = None
         super().__init__(factorize=factorize)
 
     # Public name retained for compatibility with earlier code
@@ -219,15 +221,28 @@ class SparseLinearSolver(LinearSolver):
                     
                     b_np = np.asarray(b, dtype=np.float64).reshape(-1)
                     
+                    # Optional initial guess (x0)
+                    x0_np = None
+                    try:
+                        if isinstance(self.initial_guess, np.ndarray) and self.initial_guess.size == A_csr.shape[0]:
+                            x0_np = np.asarray(self.initial_guess, dtype=np.float64).reshape(-1)
+                    except Exception:
+                        x0_np = None
+
                     # Estimate bytes to send (dominant payload only)
                     if _prof:
                         _bytes_in = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
+                        if x0_np is not None:
+                            _bytes_in += int(x0_np.nbytes)
 
                     # Generate unique request ID
                     request_id = str(uuid.uuid4())
                     
                     # Send request to server (include phase for preconditioner caching)
-                    data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
+                    if x0_np is not None:
+                        data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase, x0_np)
+                    else:
+                        data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
                     if _prof:
                         _t_put0 = time.time()
                     input_queue.put(data)
@@ -259,6 +274,8 @@ class SparseLinearSolver(LinearSolver):
                                             f"wait_ms={_wait_ms:.2f} bytes_out={_bytes_out}",
                                             flush=True,
                                         )
+                                    # Clear initial guess after use to avoid unintended reuse
+                                    self.initial_guess = None
                                     return x
                         except Empty:
                             if time.time() - start_time > timeout:
@@ -333,7 +350,7 @@ class SparseLinearSolver(LinearSolver):
                 return _np.asarray(x_cn)
             return solve_legate
 
-        # --- Default SciPy CPU ---
+    # --- SciPy CPU direct (spsolve) ---
         def solve_cpu(A, b, phase='forward', θ_current=None):
             return spsolve(A, b, use_umfpack=self.use_umfpack)
         return solve_cpu
