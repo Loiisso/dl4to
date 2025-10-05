@@ -5,7 +5,7 @@ __all__ = [
     'FDMDerivatives', 'FDMAdjointDerivatives', 'FDMAssembly', 'UnpaddedFDM', 'FDM',
     'configure_legion_memory'
 ]
-from typing import Callable
+from typing import Callable, Any
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
 import torch, numpy as np, os, copy  # added required imports
@@ -15,9 +15,11 @@ import socket
 import uuid
 import time
 from queue import Empty
+
+# Optional UMFPACK factorization
 try:
     from scikits.umfpack import factorized
-except ImportError:
+except Exception:
     from scipy.sparse.linalg import factorized
 
 # Optional backend availability flags
@@ -39,6 +41,14 @@ try:
     HAVE_PYAMGX = True
 except Exception:
     HAVE_PYAMGX = False
+
+# Optional torch-fem backend
+try:
+    from torchfem.sparse import sparse_solve as tfem_sparse_solve
+    from torchfem.sparse import CachedSolve as TFEMCachedSolve
+    HAVE_TORCHFEM = True
+except Exception:
+    HAVE_TORCHFEM = False
 
 # Global singleton for MFEM device to avoid reconfiguration aborts
 _MFEM_DEVICE_SINGLETON = None
@@ -108,7 +118,7 @@ class AutogradLinearSolver(torch.autograd.Function):
         with torch.no_grad():
             phase = 'adjoint'
             flat_np_grad_output = grad_output.flatten().cpu().numpy()
-
+            t_adj0 = _pde_now()
             if factorize:
                 y = solver(flat_np_grad_output)
             else:
@@ -116,12 +126,15 @@ class AutogradLinearSolver(torch.autograd.Function):
                     y = solver(A_mat, flat_np_grad_output, phase=phase, θ_current=θ.detach().cpu().numpy())
                 except TypeError:
                     y = solver(A_mat, flat_np_grad_output, phase=phase)
-
+            _pde_log("adjoint_solve", t_adj0)
             y = torch.from_numpy(y).clone().requires_grad_(False)
             x = x.clone().requires_grad_(False)
-
+        t_Aop0 = _pde_now()
         expr = torch.sum(y * (b - A_op(x, θ).flatten()))
+        _pde_log("Aop_residual", t_Aop0)
+        t_grad0 = _pde_now()
         grad_input = torch.autograd.grad(expr, θ)
+        _pde_log("grad_theta", t_grad0)
         return grad_input[0], None, None, None, None, None
 
 
@@ -154,6 +167,10 @@ class SparseLinearSolver(LinearSolver):
         self.amgx_config = amgx_config
         # Optional initial guess for iterative solvers (used by 'mfem' backend)
         self.initial_guess = None
+        # torch-fem cached solve for warm starts
+        self._tfem_cache = TFEMCachedSolve() if 'HAVE_TORCHFEM' in globals() and HAVE_TORCHFEM else None
+        # Optional RBM modes for torch-fem AMG preconditioner
+        self._tfem_B = None  # type: ignore[assignment]
         super().__init__(factorize=factorize)
 
     # Public name retained for compatibility with earlier code
@@ -173,6 +190,31 @@ class SparseLinearSolver(LinearSolver):
                 try:
                     # Minimal, opt-in client-side comm profiling
                     _prof = os.getenv("MFEM_COMM_PROFILE", "0") == "1"
+                    _log_path = os.getenv("MFEM_CLIENT_TIMINGS", "saved_solutions/mfem_client_timings.jsonl")
+                    import time as _time
+                    import json as _json
+                    from pathlib import Path as _Path
+                    _use_shm = os.getenv("MFEM_USE_SHM", "0") == "1"
+                    _shm_handles = []  # to hold client-owned shared memory until response
+                    def _shm_create_from(arr, name_prefix):
+                        from multiprocessing import shared_memory as _shm
+                        a = np.ascontiguousarray(arr)
+                        shm = _shm.SharedMemory(create=True, size=a.nbytes)
+                        _shm_handles.append(shm)
+                        # write bytes
+                        mv = memoryview(shm.buf)
+                        mv[:a.nbytes] = a.view(np.uint8)
+                        return shm
+                    def _t_ms(t0):
+                        return (_time.perf_counter() - t0) * 1000.0
+                    def _log_row(row: dict):
+                        try:
+                            p = _Path(_log_path)
+                            p.parent.mkdir(parents=True, exist_ok=True)
+                            with open(p, 'a') as f:
+                                f.write(_json.dumps(row) + "\n")
+                        except Exception:
+                            pass
 
                     # Connect to MFEM solver server
                     port = 50000
@@ -212,12 +254,14 @@ class SparseLinearSolver(LinearSolver):
                         
                     
                     # Convert matrix to CSR format for serialization
+                    t_asm0 = _time.perf_counter()
                     A_csr = A.tocsr() if hasattr(A, 'tocsr') else csr_matrix(A)
                     if A_csr.dtype != np.float64:
                         A_csr = A_csr.astype(np.float64)
                     # Reduce payload size: ensure index arrays are int32 (common SciPy default, half the bytes vs int64)
                     indices_i32 = np.asarray(A_csr.indices, dtype=np.int32)
                     indptr_i32 = np.asarray(A_csr.indptr, dtype=np.int32)
+                    t_asm_ms = _t_ms(t_asm0)
                     
                     b_np = np.asarray(b, dtype=np.float64).reshape(-1)
                     
@@ -230,29 +274,55 @@ class SparseLinearSolver(LinearSolver):
                         x0_np = None
 
                     # Estimate bytes to send (dominant payload only)
-                    if _prof:
-                        _bytes_in = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
-                        if x0_np is not None:
-                            _bytes_in += int(x0_np.nbytes)
+                    _bytes_out = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
+                    if x0_np is not None:
+                        _bytes_out += int(x0_np.nbytes)
 
                     # Generate unique request ID
                     request_id = str(uuid.uuid4())
                     
                     # Send request to server (include phase for preconditioner caching)
-                    if x0_np is not None:
-                        data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase, x0_np)
+                    if _use_shm:
+                        # Build shared memory payload (single-rank optimized)
+                        sh_data = _shm_create_from(A_csr.data, "A_data")
+                        sh_indices = _shm_create_from(indices_i32, "A_indices")
+                        sh_indptr = _shm_create_from(indptr_i32, "A_indptr")
+                        sh_b = _shm_create_from(b_np, "b")
+                        sh_x0 = _shm_create_from(x0_np, "x0") if x0_np is not None else None
+                        payload = {
+                            'transport': 'shm_v1',
+                            'A_shape': tuple(map(int, A_csr.shape)),
+                            'nnz': int(A_csr.nnz),
+                            'dtypes': {
+                                'data': A_csr.data.dtype.str,
+                                'indices': np.dtype(np.int32).str,
+                                'indptr': np.dtype(np.int32).str,
+                                'b': b_np.dtype.str,
+                                'x0': x0_np.dtype.str if x0_np is not None else None,
+                            },
+                            'names': {
+                                'data': sh_data.name,
+                                'indices': sh_indices.name,
+                                'indptr': sh_indptr.name,
+                                'b': sh_b.name,
+                                'x0': (sh_x0.name if sh_x0 is not None else None),
+                            },
+                            'request_id': request_id,
+                            'phase': phase,
+                        }
+                        _t_put0 = _time.perf_counter()
+                        input_queue.put(payload)
                     else:
-                        data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
-                    if _prof:
-                        _t_put0 = time.time()
-                    input_queue.put(data)
-                    if _prof:
-                        _put_ms = (time.time() - _t_put0) * 1000.0
+                        if x0_np is not None:
+                            data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase, x0_np)
+                        else:
+                            data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
+                        _t_put0 = _time.perf_counter()
+                        input_queue.put(data)
+                    _put_ms = _t_ms(_t_put0)
                     
                     # Wait for response with timeout
-                    start_time = time.time()
-                    if _prof:
-                        _t_wait0 = start_time
+                    _t_wait0 = _time.perf_counter()
                     timeout = 900  # 15 minutes
                     
                     while True:
@@ -265,20 +335,39 @@ class SparseLinearSolver(LinearSolver):
                             else:  # Success case
                                 x, req_id = result
                                 if req_id == request_id:
+                                    _wait_ms = _t_ms(_t_wait0)
+                                    x_arr = np.asarray(x)
+                                    _bytes_in = int(x_arr.nbytes)
                                     if _prof:
-                                        _wait_ms = (time.time() - _t_wait0) * 1000.0
-                                        x_arr = np.asarray(x)
-                                        _bytes_out = int(x_arr.nbytes)
                                         print(
-                                            f"[mfem-comm] bytes_in={_bytes_in} put_ms={_put_ms:.2f} "
-                                            f"wait_ms={_wait_ms:.2f} bytes_out={_bytes_out}",
+                                            f"[mfem-comm] asm_ms={t_asm_ms:.2f} put_ms={_put_ms:.2f} "
+                                            f"wait_ms={_wait_ms:.2f} bytes_out={_bytes_out} bytes_in={_bytes_in}",
                                             flush=True,
                                         )
+                                        _log_row({
+                                            "phase": phase,
+                                            "asm_ms": round(t_asm_ms, 3),
+                                            "put_ms": round(_put_ms, 3),
+                                            "wait_ms": round(_wait_ms, 3),
+                                            "bytes_out": int(_bytes_out),
+                                            "bytes_in": int(_bytes_in),
+                                        })
                                     # Clear initial guess after use to avoid unintended reuse
                                     self.initial_guess = None
+                                    # Cleanup shared memory segments we created
+                                    if _use_shm:
+                                        try:
+                                            for shm in _shm_handles:
+                                                try:
+                                                    shm.close()
+                                                    shm.unlink()
+                                                except Exception:
+                                                    pass
+                                        except Exception:
+                                            pass
                                     return x
                         except Empty:
-                            if time.time() - start_time > timeout:
+                            if (_time.perf_counter() - _t_wait0) > timeout:
                                 raise ValueError("[mfem] Timeout waiting for server response")
                             continue
                             
@@ -349,6 +438,69 @@ class SparseLinearSolver(LinearSolver):
                 x_cn, info = ls_gmres(A_ls, b_cn, tol=self.cg_tol, maxiter=self.cg_max_iter, M=M)
                 return _np.asarray(x_cn)
             return solve_legate
+
+        # --- torch-fem sparse backend ---
+        if opt in ('torch-fem', 'torch_fem', 'torchfem'):
+            if not HAVE_TORCHFEM:
+                def _err(*args, **kwargs):
+                    raise ImportError("torch-fem is not installed. Install with 'pip install torch-fem' in your environment.")
+                return _err
+
+            def solve_torchfem(A, b, phase='forward', θ_current=None):
+                # Convert SciPy sparse to torch sparse COO
+                A_csr = A.tocsr() if hasattr(A, 'tocsr') else csr_matrix(A)
+                A_coo = A_csr.tocoo()
+                indices = torch.tensor(
+                    np.vstack([A_coo.row, A_coo.col]), dtype=torch.long
+                )
+                values = torch.tensor(A_coo.data, dtype=torch.float64)
+                A_t = torch.sparse_coo_tensor(indices, values, size=A_coo.shape)
+
+                b_t = torch.tensor(b, dtype=torch.float64)
+
+                # Choose device automatically; allow override via env
+                device_env = os.getenv('TORCHFEM_DEVICE')
+                device = device_env if device_env in (None, 'cpu', 'cuda') else None
+                if device is None:
+                    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+                # Method selection: prefer cg for large systems, else spsolve
+                method = None
+                try:
+                    n = A_t.shape[0]
+                    method = 'cg' if n >= 10000 else 'spsolve'
+                except Exception:
+                    method = None
+
+                # Warm start via CachedSolve
+                cache = self._tfem_cache or TFEMCachedSolve()
+                if isinstance(self.initial_guess, np.ndarray) and self.initial_guess.size == A_csr.shape[0]:
+                    try:
+                        cache.update_x(torch.tensor(self.initial_guess, dtype=torch.float64))
+                    except Exception:
+                        pass
+
+                # Solve
+                x_t = tfem_sparse_solve(
+                    A=A_t.coalesce(),
+                    b=b_t,
+                    B=self._tfem_B if (self._tfem_B is not None) else None,
+                    rtol=float(self.cg_tol),
+                    device=device,
+                    method=('minres' if self._tfem_B is not None else method),
+                    M=None,
+                    cached_solve=cache,
+                    update_cache=True if phase == 'forward' else False,
+                )
+
+                # Clear one-shot initial guess
+                self.initial_guess = None
+                # Persist cache on solver instance
+                self._tfem_cache = cache
+
+                return x_t.detach().cpu().numpy()
+
+            return solve_torchfem
 
     # --- SciPy CPU direct (spsolve) ---
         def solve_cpu(A, b, phase='forward', θ_current=None):
@@ -797,6 +949,8 @@ class UnpaddedFDM(PDESolver):
     def __init__(self, θ_min:float=1e-6, # The minimal value in the stiffness matrix. For numerical reasons we can not allow 0s, since they may lead to singular matrices.
                 use_forward_differences:bool=True, # Whether to use forward differences or central differences.
                 assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
+                interpolation_model:str='simp', # 'simp' or 'ramp'
+                ramp_q:float=8.0 # RAMP parameter q controlling penalization strength
                 ):
         self._θ_min = θ_min
         # Use iterative solver (factorize=False) to allow θ-based warm-start gating & GPU path
@@ -809,6 +963,9 @@ class UnpaddedFDM(PDESolver):
         self.use_forward_differences = use_forward_differences
         self.assemble_tensors_when_passed_to_problem = assemble_tensors_when_passed_to_problem
         self.assembled_tensors = False
+        self.interpolation_model = interpolation_model.lower()
+        assert self.interpolation_model in ('simp', 'ramp'), "interpolation_model must be 'simp' or 'ramp'"
+        self.ramp_q = float(ramp_q)
         super().__init__(assemble_tensors_when_passed_to_problem)
 
 
@@ -946,15 +1103,30 @@ class UnpaddedFDM(PDESolver):
     def _apply_θp(self, σ, θ, p=1., normalize=True):
         E = 1. if normalize else self.problem.E
         E_min = E * self.θ_min
-        θ_ = E_min + θ**p * (E - E_min)
-        return θ_ * σ
+        frac = self._interp_fraction(θ, p)
+        θ_eff = E_min + frac * (E - E_min)
+        return θ_eff * σ
 
 
     def _assemble_θ(self, θ, p=1.):
         E = 1.
         E_min = E * self.θ_min
-        θ_ = E_min + (θ**p).flatten().repeat(9).detach().numpy() * (E - E_min)
-        return diags(θ_)
+        frac = self._interp_fraction(θ, p)
+        θ_flat = (E_min + frac * (E - E_min)).flatten().repeat(9).detach().numpy()
+        return diags(θ_flat)
+
+    def _interp_fraction(self, θ: torch.Tensor, p: float):
+        """Return dimensionless interpolation fraction in [θ_min, 1] for the chosen model.
+
+        For SIMP: frac = θ**p
+        For RAMP: frac = θ / (1 + q * (1 - θ))
+        """
+        if self.interpolation_model == 'simp':
+            return θ.clamp(self.θ_min, 1.0) ** p
+        # RAMP
+        q = self.ramp_q
+        θc = θ.clamp(self.θ_min, 1.0)
+        return θc / (1.0 + q * (1.0 - θc))
 
 
     def _A(self, u, θ, dirichlet=True, p=1.):
@@ -1006,8 +1178,12 @@ class UnpaddedFDM(PDESolver):
         θ = self._get_θ_from_solution(solution, binary=binary, clone=True)
         θ = θ.clamp(self.θ_min, 1)
         A_op = lambda u, θ: self._A(u, θ, p=p)
+        t_asm0 = _pde_now()
         A_mat = self._assemble_A(θ.cpu(), p)
+        _pde_log("assemble_A", t_asm0, extra=f"nnz={getattr(A_mat,'nnz', 'NA')}")
+        t_solv0 = _pde_now()
         u = self._linear_solver(θ.cpu(), A_op, self.b.flatten(), A_mat)
+        _pde_log("linear_solve", t_solv0, extra=f"shape={A_mat.shape}")
         u = u.view(3, θ.shape[-3], θ.shape[-2], θ.shape[-1]).to(θ.device)
 
         if binary:
@@ -1021,29 +1197,81 @@ class UnpaddedFDM(PDESolver):
     def _get_σ(self, solution, p=1., u=None, binary=False):
         if u is None:
             u = self._get_u(solution, p=p, binary=binary)
-
+        t_strain0 = _pde_now()
         θ = self._get_θ_from_solution(solution, binary=binary, clone=False)
         ε = self._J(u)
         σ = self._G(ε)
         σ = self._apply_θp(σ, θ, p=1., normalize=False)
+        _pde_log("stress_compute", t_strain0)
         return σ
+
+    def _build_torchfem_rbm_B(self) -> torch.Tensor | None:
+        """Construct 6 rigid-body modes (3 translations + 3 rotations) for a solid grid.
+
+        Returns a dense torch tensor B of shape (ndof, m) in float64, matching
+        the solver's channel-major DOF ordering, with Dirichlet DOFs zeroed out.
+        If construction fails, returns None.
+        """
+        try:
+            # Shapes
+            _, X, Y, Z = self.Ω_dirichlet.shape  # (3, X, Y, Z)
+            device = self.problem.device if hasattr(self.problem, 'device') else 'cpu'
+            dtype = torch.float64
+
+            # Coordinates centered around origin, scaled by spacing h
+            hx, hy, hz = float(self.h[0]), float(self.h[1]), float(self.h[2])
+            xs = (torch.arange(X, dtype=dtype) - 0.5 * (X - 1)) * hx
+            ys = (torch.arange(Y, dtype=dtype) - 0.5 * (Y - 1)) * hy
+            zs = (torch.arange(Z, dtype=dtype) - 0.5 * (Z - 1)) * hz
+            Xg, Yg, Zg = torch.meshgrid(xs, ys, zs, indexing='ij')
+
+            # Allocate 6 modes in (3, X, Y, Z)
+            modes = torch.zeros((6, 3, X, Y, Z), dtype=dtype)
+            # Translations
+            modes[0, 0, :, :, :] = 1.0  # tx
+            modes[1, 1, :, :, :] = 1.0  # ty
+            modes[2, 2, :, :, :] = 1.0  # tz
+            # Rotations (u = ω x r)
+            # About x: u = (0, -z, y)
+            modes[3, 1, :, :, :] = -Zg
+            modes[3, 2, :, :, :] =  Yg
+            # About y: u = (z, 0, -x)
+            modes[4, 0, :, :, :] =  Zg
+            modes[4, 2, :, :, :] = -Xg
+            # About z: u = (-y, x, 0)
+            modes[5, 0, :, :, :] = -Yg
+            modes[5, 1, :, :, :] =  Xg
+
+            # Zero out constrained DOFs
+            Ωd = self.Ω_dirichlet
+            for k in range(6):
+                mk = modes[k]
+                mk[Ωd] = 0.0
+
+            # Flatten each mode in channel-major to match A,b flattening
+            # Stack into (ndof, 6)
+            cols = []
+            for k in range(6):
+                cols.append(modes[k].flatten())
+            B = torch.stack(cols, dim=1)  # (ndof, 6)
+            return B.to(dtype=dtype, device=device)
+        except Exception:
+            return None
 
 
     def solve_pde(self,
-                solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
-                p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
-                binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
-                get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
-                ):
+                 solution: Any, # The solution for which the PDE should be solved.
+                 p: float = 1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
+                 binary: bool = False, # Whether the densities in the solution should be binarized before solving the PDE.
+                 get_padded: bool = False # Unused for UnpaddedFDM; kept for API compatibility.
+                 ):
         """
         Solves the pde for `solution` and SIMP exponent `p`. Returns three `torch.Tensor` objects: displacements `u`, stresses `σ` and von Mises stresses `σ_vm`.
         """
-        u = self._get_u(solution, p=p, binary=binary, get_padded=True)
-        σ = self._get_σ(solution, p=p, u=u, binary=binary, get_padded=True)
+        u = self._get_u(solution, p=p, binary=binary)
+        σ = self._get_σ(solution, p=p, u=u, binary=binary)
         σ_vm = get_σ_vm(σ)
-        if get_padded:
-            return u, σ, σ_vm
-        return self._remove_padding(u), self._remove_padding(σ), self._remove_padding(σ_vm)
+        return u, σ, σ_vm
     
 
     # Cell
@@ -1054,13 +1282,17 @@ class FDM(UnpaddedFDM):
     def __init__(self, θ_min:float=1e-6, # The minimal value in the stiffness matrix. For numerical reasons we can not allow 0s, since they may lead to singular matrices.
                 use_forward_differences:bool=True, # Whether to use forward differences or central differences.
                 assemble_tensors_when_passed_to_problem:bool=True, # Whether the PDE solver methods pre-assembles any tensors or arrays before solving the PDE for a concrete problem.
-                padding_depth:int=0 # The depth of the padding surrounding the design space. In some cases, it is recommended to increase the padding depth to 2 to improve results but also increase running time.
+                padding_depth:int=0, # The depth of the padding surrounding the design space. In some cases, it is recommended to increase the padding depth to 2 to improve results but also increase running time.
+                interpolation_model:str='simp', # 'simp' or 'ramp'
+                ramp_q:float=8.0 # RAMP parameter q controlling penalization strength
                 ):
         self.padding_depth = padding_depth
         super().__init__(
             θ_min=θ_min,
             use_forward_differences=use_forward_differences,
-            assemble_tensors_when_passed_to_problem=assemble_tensors_when_passed_to_problem
+            assemble_tensors_when_passed_to_problem=assemble_tensors_when_passed_to_problem,
+            interpolation_model=interpolation_model,
+            ramp_q=ramp_q
         )
 
 
@@ -1144,7 +1376,7 @@ class FDM(UnpaddedFDM):
 
 
     def solve_pde(self,
-                solution:"dl4to.solution.Solution", # The solution for which the PDE should be solved.
+                solution: Any, # The solution for which the PDE should be solved.
                 p:float=1., # The SIMP exponent when solving the PDE. Should usually be left at its default value of `1.`.
                 binary:bool=False, # Whether the densities in the solution should be binarized before solving the PDE.
                 get_padded:bool=False # Whether the density should be padded before the PDE is solved. Takes a bit longer to solve, but is more accurate.
@@ -1158,3 +1390,18 @@ class FDM(UnpaddedFDM):
         if get_padded:
             return u, σ, σ_vm
         return self._remove_padding(u), self._remove_padding(σ), self._remove_padding(σ_vm)
+
+import time as _pde_time_mod
+
+_PDE_TIMING = os.getenv("PDE_TIMING", "0") == "1"
+
+def _pde_now():
+    return _pde_time_mod.perf_counter()
+
+def _pde_log(stage: str, t_start: float, extra: str = ""):
+    if _PDE_TIMING:
+        dt = (_pde_time_mod.perf_counter() - t_start) * 1000.0
+        msg = f"[PDE-TIME] {stage} {dt:.2f} ms"
+        if extra:
+            msg += f" | {extra}"
+        print(msg, flush=True)
