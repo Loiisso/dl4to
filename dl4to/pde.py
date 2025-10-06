@@ -182,6 +182,15 @@ class SparseLinearSolver(LinearSolver):
 
         # --- MFEM distributed backend (with optional PyMETIS partition) ---
         if opt == 'mfem':
+            # Automatic values-only mode: after first full matrix with a given sparsity pattern
+            # subsequent calls send only updated numeric values (and RHS). Can be disabled by MFEM_NO_VALUES_ONLY=1.
+            auto_disable = os.getenv('MFEM_NO_VALUES_ONLY', '0') == '1'
+            reuse_prec = os.getenv('MFEM_REUSE_PREC', '0') == '1'
+            # Pattern cache for values-only mode (structure reuse) stored on solver instance
+            if not hasattr(self, '_mfem_pattern_sig'):
+                self._mfem_pattern_sig = None  # (shape, nnz, hash)
+                self._mfem_pattern_indices = None
+                self._mfem_pattern_indptr = None
             def solve_mfem_remote(A, b, phase='forward', θ_current=None):
                 """
                 Remote MFEM solver using client-server architecture.
@@ -261,6 +270,23 @@ class SparseLinearSolver(LinearSolver):
                     # Reduce payload size: ensure index arrays are int32 (common SciPy default, half the bytes vs int64)
                     indices_i32 = np.asarray(A_csr.indices, dtype=np.int32)
                     indptr_i32 = np.asarray(A_csr.indptr, dtype=np.int32)
+                    use_values_only = False
+                    pattern_sig = None
+                    if not auto_disable:
+                        try:
+                            import hashlib as _hashlib
+                            h = _hashlib.blake2b(digest_size=8)
+                            h.update(indices_i32.tobytes())
+                            h.update(indptr_i32.tobytes())
+                            pattern_sig = (A_csr.shape, int(A_csr.nnz), h.hexdigest())
+                            if self._mfem_pattern_sig == pattern_sig:
+                                use_values_only = True
+                            else:
+                                self._mfem_pattern_sig = pattern_sig
+                                self._mfem_pattern_indices = indices_i32.copy()
+                                self._mfem_pattern_indptr = indptr_i32.copy()
+                        except Exception:
+                            use_values_only = False
                     t_asm_ms = _t_ms(t_asm0)
                     
                     b_np = np.asarray(b, dtype=np.float64).reshape(-1)
@@ -274,7 +300,10 @@ class SparseLinearSolver(LinearSolver):
                         x0_np = None
 
                     # Estimate bytes to send (dominant payload only)
-                    _bytes_out = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
+                    if use_values_only:
+                        _bytes_out = int(A_csr.data.nbytes + b_np.nbytes)
+                    else:
+                        _bytes_out = int(A_csr.data.nbytes + indices_i32.nbytes + indptr_i32.nbytes + b_np.nbytes)
                     if x0_np is not None:
                         _bytes_out += int(x0_np.nbytes)
 
@@ -282,43 +311,75 @@ class SparseLinearSolver(LinearSolver):
                     request_id = str(uuid.uuid4())
                     
                     # Send request to server (include phase for preconditioner caching)
-                    if _use_shm:
-                        # Build shared memory payload (single-rank optimized)
-                        sh_data = _shm_create_from(A_csr.data, "A_data")
-                        sh_indices = _shm_create_from(indices_i32, "A_indices")
-                        sh_indptr = _shm_create_from(indptr_i32, "A_indptr")
-                        sh_b = _shm_create_from(b_np, "b")
-                        sh_x0 = _shm_create_from(x0_np, "x0") if x0_np is not None else None
-                        payload = {
-                            'transport': 'shm_v1',
-                            'A_shape': tuple(map(int, A_csr.shape)),
-                            'nnz': int(A_csr.nnz),
-                            'dtypes': {
-                                'data': A_csr.data.dtype.str,
-                                'indices': np.dtype(np.int32).str,
-                                'indptr': np.dtype(np.int32).str,
-                                'b': b_np.dtype.str,
-                                'x0': x0_np.dtype.str if x0_np is not None else None,
-                            },
-                            'names': {
-                                'data': sh_data.name,
-                                'indices': sh_indices.name,
-                                'indptr': sh_indptr.name,
-                                'b': sh_b.name,
-                                'x0': (sh_x0.name if sh_x0 is not None else None),
-                            },
-                            'request_id': request_id,
-                            'phase': phase,
-                        }
-                        _t_put0 = _time.perf_counter()
-                        input_queue.put(payload)
-                    else:
-                        if x0_np is not None:
-                            data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase, x0_np)
+                    if use_values_only:
+                        # Only send numeric values (and rhs / initial guess) – structure assumed cached on server
+                        if _use_shm:
+                            sh_data = _shm_create_from(A_csr.data, "A_data_vals")
+                            sh_b = _shm_create_from(b_np, "b")
+                            sh_x0 = _shm_create_from(x0_np, "x0") if x0_np is not None else None
+                            payload = {
+                                'transport': 'shm_v1',
+                                'values_only': True,
+                                'A_shape': tuple(map(int, A_csr.shape)),
+                                'nnz': int(A_csr.nnz),
+                                'dtypes': {
+                                    'data': A_csr.data.dtype.str,
+                                    'b': b_np.dtype.str,
+                                    'x0': x0_np.dtype.str if x0_np is not None else None,
+                                },
+                                'names': {
+                                    'data': sh_data.name,
+                                    'b': sh_b.name,
+                                    'x0': (sh_x0.name if sh_x0 is not None else None),
+                                },
+                                'request_id': request_id,
+                                'phase': phase,
+                            }
+                            _t_put0 = _time.perf_counter(); input_queue.put(payload)
                         else:
-                            data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
-                        _t_put0 = _time.perf_counter()
-                        input_queue.put(data)
+                            if x0_np is not None:
+                                data = ('VALUES_ONLY', A_csr.data, b_np, request_id, phase, x0_np)
+                            else:
+                                data = ('VALUES_ONLY', A_csr.data, b_np, request_id, phase)
+                            _t_put0 = _time.perf_counter(); input_queue.put(data)
+                    else:
+                        if _use_shm:
+                            # Build shared memory payload (single-rank optimized)
+                            sh_data = _shm_create_from(A_csr.data, "A_data")
+                            sh_indices = _shm_create_from(indices_i32, "A_indices")
+                            sh_indptr = _shm_create_from(indptr_i32, "A_indptr")
+                            sh_b = _shm_create_from(b_np, "b")
+                            sh_x0 = _shm_create_from(x0_np, "x0") if x0_np is not None else None
+                            payload = {
+                                'transport': 'shm_v1',
+                                'A_shape': tuple(map(int, A_csr.shape)),
+                                'nnz': int(A_csr.nnz),
+                                'dtypes': {
+                                    'data': A_csr.data.dtype.str,
+                                    'indices': np.dtype(np.int32).str,
+                                    'indptr': np.dtype(np.int32).str,
+                                    'b': b_np.dtype.str,
+                                    'x0': x0_np.dtype.str if x0_np is not None else None,
+                                },
+                                'names': {
+                                    'data': sh_data.name,
+                                    'indices': sh_indices.name,
+                                    'indptr': sh_indptr.name,
+                                    'b': sh_b.name,
+                                    'x0': (sh_x0.name if sh_x0 is not None else None),
+                                },
+                                'request_id': request_id,
+                                'phase': phase,
+                            }
+                            _t_put0 = _time.perf_counter()
+                            input_queue.put(payload)
+                        else:
+                            if x0_np is not None:
+                                data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase, x0_np)
+                            else:
+                                data = (A_csr.data, indices_i32, indptr_i32, A_csr.shape, b_np, request_id, phase)
+                            _t_put0 = _time.perf_counter()
+                            input_queue.put(data)
                     _put_ms = _t_ms(_t_put0)
                     
                     # Wait for response with timeout
@@ -1152,8 +1213,27 @@ class UnpaddedFDM(PDESolver):
 
 
     def _assemble_A(self, θ, p=1.):
-        θ_mat = self._assemble_θ(θ, p)
-        A = self._Jt_mat.dot(θ_mat.dot(self._GJ_mat)) + self._Ω_dirichlet_diags
+        # Optimized assemble: in-place row scaling of base GJ (avoid building diag matrix)
+        # θ_eff repeats per strain component (9 per voxel) to match GJ row blocks.
+        E = 1.0
+        E_min = E * self.θ_min
+        frac = self._interp_fraction(θ, p)
+        θ_eff = (E_min + frac * (E - E_min)).flatten().repeat(9).detach().numpy()
+        # Cache immutable base pattern once
+        if not hasattr(self, '_GJ_base_pattern'):
+            self._GJ_base_pattern = self._GJ_mat.tocsr().copy()
+        base = self._GJ_base_pattern
+        GJ = base.copy()  # copy values (structure reused)
+        indptr = GJ.indptr
+        data = GJ.data
+        # Scale each row's slice by θ_eff[row]
+        # (Assumes ordering consistent: one θ_eff per row in GJ)
+        for r in range(len(indptr) - 1):
+            start, end = indptr[r], indptr[r + 1]
+            if start != end:
+                data[start:end] *= θ_eff[r]
+        # Form A = J^T * (scaled GJ) + Dirichlet diagonal
+        A = self._Jt_mat.dot(GJ) + self._Ω_dirichlet_diags
         return csc_matrix(A)
 
 
