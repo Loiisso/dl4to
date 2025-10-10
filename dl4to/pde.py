@@ -8,7 +8,7 @@ __all__ = [
 from typing import Callable, Any
 from scipy.sparse.linalg import spsolve
 from scipy.sparse import csr_matrix
-import torch, numpy as np, os, copy  # added required imports
+import torch, numpy as np, os, copy, ctypes, sys  # added required imports
 import multiprocessing as mp
 from multiprocessing.managers import SyncManager
 import socket
@@ -41,6 +41,25 @@ try:
     HAVE_PYAMGX = True
 except Exception:
     HAVE_PYAMGX = False
+
+try:  # PETSc optional GPU backend
+    _petsc_dir = os.getenv('PETSC_DIR')
+    if _petsc_dir:
+        _py_ver = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        _petsc_paths = [
+            os.path.join(_petsc_dir, 'lib', _py_ver, 'site-packages'),
+            os.path.join(_petsc_dir, 'lib')
+        ]
+        for _pth in _petsc_paths:
+            if os.path.isdir(_pth) and _pth not in sys.path:
+                sys.path.append(_pth)
+    import petsc4py  # type: ignore
+    from petsc4py import PETSc  # type: ignore
+    HAVE_PETSC4PY = True
+except Exception:
+    HAVE_PETSC4PY = False
+    PETSc = None  # type: ignore
+    petsc4py = None  # type: ignore
 
 # Optional torch-fem backend
 try:
@@ -1218,23 +1237,191 @@ class UnpaddedFDM(PDESolver):
         E = 1.0
         E_min = E * self.θ_min
         frac = self._interp_fraction(θ, p)
-        θ_eff = (E_min + frac * (E - E_min)).flatten().repeat(9).detach().numpy()
-        # Cache immutable base pattern once
-        if not hasattr(self, '_GJ_base_pattern'):
-            self._GJ_base_pattern = self._GJ_mat.tocsr().copy()
-        base = self._GJ_base_pattern
-        GJ = base.copy()  # copy values (structure reused)
-        indptr = GJ.indptr
-        data = GJ.data
-        # Scale each row's slice by θ_eff[row]
-        # (Assumes ordering consistent: one θ_eff per row in GJ)
-        for r in range(len(indptr) - 1):
-            start, end = indptr[r], indptr[r + 1]
+        θ_eff_np = (E_min + frac * (E - E_min)).flatten().repeat(9).detach().numpy()
+
+        base = self._GJ_mat.tocsr().copy()
+        base.sort_indices()
+        base = csr_matrix((base.data.astype(np.float64, copy=False),
+                           base.indices.astype(np.int32, copy=False),
+                           base.indptr.astype(np.int32, copy=False)), shape=base.shape)
+        GJ = base.copy()
+
+        row_ids = np.empty(GJ.data.shape[0], dtype=np.int64)
+        for r in range(GJ.shape[0]):
+            start, end = GJ.indptr[r], GJ.indptr[r + 1]
             if start != end:
-                data[start:end] *= θ_eff[r]
-        # Form A = J^T * (scaled GJ) + Dirichlet diagonal
-        A = self._Jt_mat.dot(GJ) + self._Ω_dirichlet_diags
-        return csc_matrix(A)
+                row_ids[start:end] = r
+        np.multiply(GJ.data, θ_eff_np[row_ids], out=GJ.data)
+
+        Jt_csr = self._Jt_mat.tocsr().copy()
+        Jt_csr.sort_indices()
+        Jt_csr = csr_matrix((Jt_csr.data.astype(np.float64, copy=False),
+                             Jt_csr.indices.astype(np.int32, copy=False),
+                             Jt_csr.indptr.astype(np.int32, copy=False)), shape=Jt_csr.shape)
+
+        verbose_gpu = os.getenv('PDE_ASSEMBLY_VERBOSE', '0') == '1'
+        use_petsc_gpu = os.getenv('PDE_ASSEMBLY_USE_PETSC_GPU', '0') == '1'
+
+        def _finalize_csr(A_csr_in: csr_matrix):
+            A_local = A_csr_in
+            if self._Ω_dirichlet_diags.nnz:
+                A_local = A_local + self._Ω_dirichlet_diags.tocsr()
+            A_local.sort_indices()
+            A_local = csr_matrix((A_local.data.astype(np.float64, copy=False),
+                                  A_local.indices.astype(np.int32, copy=False),
+                                  A_local.indptr.astype(np.int32, copy=False)), shape=A_local.shape)
+            A_csc_local = A_local.tocsc()
+            A_csc_local.sort_indices()
+            A_csc_local.indices = A_csc_local.indices.astype(np.int32, copy=False)
+            A_csc_local.indptr = A_csc_local.indptr.astype(np.int32, copy=False)
+            return A_csc_local
+
+        def _petsc_matmul(Jt_cpu, GJ_cpu):
+
+            print(f"[PETSc-DEBUG] Entering _petsc_matmul, Jt shape={Jt_cpu.shape}, GJ shape={GJ_cpu.shape}", flush=True)
+            
+            if not HAVE_PETSC4PY or PETSc is None or petsc4py is None:
+                raise RuntimeError('petsc4py is not available')
+            
+            print(f"[PETSc-DEBUG] Checking PETSc initialization...", flush=True)
+            if not PETSc.Sys.isInitialized():
+                # Set CUDA device for PETSc before initialization
+                petsc_cuda_device = os.getenv('PETSC_CUDA_DEVICE')
+                if petsc_cuda_device is not None:
+                    print(f"[PETSc-DEBUG] Setting CUDA device for PETSc to: {petsc_cuda_device}", flush=True)
+                    # PETSc respects these environment variables
+                    os.environ['CUDA_DEVICE'] = str(petsc_cuda_device)
+                    os.environ['HYPRE_CUDA_DEVICE'] = str(petsc_cuda_device)
+                    # For process isolation, set CUDA_VISIBLE_DEVICES
+                    # NOTE: This will affect the entire process, so only set if explicitly requested
+                    petsc_cuda_visible = os.getenv('PETSC_CUDA_VISIBLE_DEVICES')
+                    if petsc_cuda_visible is not None:
+                        print(f"[PETSc-DEBUG] Setting CUDA_VISIBLE_DEVICES for PETSc to: {petsc_cuda_visible}", flush=True)
+                        os.environ['CUDA_VISIBLE_DEVICES'] = str(petsc_cuda_visible)
+                else:
+                    print(f"[PETSc-DEBUG] No PETSC_CUDA_DEVICE specified, using default GPU", flush=True)
+                
+                print(f"[PETSc-DEBUG] Initializing PETSc...", flush=True)
+                petsc4py.init([])
+                print(f"[PETSc-DEBUG] PETSc initialized successfully", flush=True)
+            else:
+                print(f"[PETSc-DEBUG] PETSc already initialized", flush=True)
+
+            mat_type_preference = os.getenv('PDE_ASSEMBLY_PETSC_TYPE', 'aijcusparse')
+            print(f"[PETSc-DEBUG] Matrix type preference: {mat_type_preference}", flush=True)
+
+            def _csr_to_petsc(csr_obj, name="matrix"):
+                print(f"[PETSc-DEBUG] Converting {name} to PETSc format, shape={csr_obj.shape}, nnz={csr_obj.nnz}", flush=True)
+                
+                mat = PETSc.Mat().create(comm=PETSc.COMM_WORLD)
+                print(f"[PETSc-DEBUG] {name}: Created PETSc Mat object", flush=True)
+                
+                mat.setSizes(csr_obj.shape)
+                print(f"[PETSc-DEBUG] {name}: Set sizes to {csr_obj.shape}", flush=True)
+                
+                type_candidates = []
+                if mat_type_preference:
+                    type_candidates.append(mat_type_preference)
+                type_candidates.append('aij')
+                
+                mat_type_set = None
+                for mat_type in type_candidates:
+                    try:
+                        print(f"[PETSc-DEBUG] {name}: Trying setType({mat_type})...", flush=True)
+                        mat.setType(mat_type)
+                        mat_type_set = mat_type
+                        print(f"[PETSc-DEBUG] {name}: Successfully set type to {mat_type}", flush=True)
+                        break
+                    except Exception as type_err:
+                        print(f"[PETSc-DEBUG] {name}: setType({mat_type}) failed: {type_err}", flush=True)
+                        if verbose_gpu:
+                            print(f"[PDE] PETSc setType({mat_type}) failed: {type_err}", flush=True)
+                
+                mat.setOption(PETSc.Mat.Option.NEW_NONZERO_ALLOCATION_ERR, False)
+                print(f"[PETSc-DEBUG] {name}: Set options", flush=True)
+                
+                mat.setUp()
+                print(f"[PETSc-DEBUG] {name}: setUp() complete", flush=True)
+                
+                indptr = csr_obj.indptr.astype(np.int32, copy=False)
+                indices = csr_obj.indices.astype(np.int32, copy=False)
+                data = csr_obj.data.astype(np.float64, copy=False)
+                print(f"[PETSc-DEBUG] {name}: Converted arrays - indptr len={len(indptr)}, indices len={len(indices)}, data len={len(data)}", flush=True)
+                
+                print(f"[PETSc-DEBUG] {name}: Calling setValuesCSR...", flush=True)
+                mat.setValuesCSR(indptr, indices, data)
+                print(f"[PETSc-DEBUG] {name}: setValuesCSR complete", flush=True)
+                
+                print(f"[PETSc-DEBUG] {name}: Calling assemblyBegin...", flush=True)
+                mat.assemblyBegin()
+                print(f"[PETSc-DEBUG] {name}: Calling assemblyEnd...", flush=True)
+                mat.assemblyEnd()
+                print(f"[PETSc-DEBUG] {name}: Assembly complete with type {mat_type_set}", flush=True)
+                
+                return mat
+
+            petsc_Jt = None
+            petsc_GJ = None
+            petsc_A = None
+            try:
+                print(f"[PETSc-DEBUG] Converting Jt matrix...", flush=True)
+                petsc_Jt = _csr_to_petsc(Jt_cpu, "Jt")
+                
+                print(f"[PETSc-DEBUG] Converting GJ matrix...", flush=True)
+                petsc_GJ = _csr_to_petsc(GJ_cpu, "GJ")
+                
+                print(f"[PETSc-DEBUG] Starting matMult operation...", flush=True)
+                petsc_A = petsc_Jt.matMult(petsc_GJ)
+                print(f"[PETSc-DEBUG] matMult complete, assembling result...", flush=True)
+                
+                petsc_A.assemblyBegin()
+                print(f"[PETSc-DEBUG] Result assemblyBegin complete", flush=True)
+                
+                petsc_A.assemblyEnd()
+                print(f"[PETSc-DEBUG] Result assemblyEnd complete", flush=True)
+                
+                print(f"[PETSc-DEBUG] Extracting CSR values from result...", flush=True)
+                indptr, indices, data = petsc_A.getValuesCSR()
+                print(f"[PETSc-DEBUG] getValuesCSR complete, converting to numpy...", flush=True)
+                
+                data_np = np.asarray(data, dtype=np.float64).copy()
+                indices_np = np.asarray(indices, dtype=np.int32).copy()
+                indptr_np = np.asarray(indptr, dtype=np.int32).copy()
+                shape = petsc_A.getSize()
+                print(f"[PETSc-DEBUG] Numpy conversion complete, result shape={shape}", flush=True)
+                
+                print(f"[PETSc-DEBUG] Creating scipy CSR matrix...", flush=True)
+                result = csr_matrix((data_np, indices_np, indptr_np), shape=shape)
+                print(f"[PETSc-DEBUG] _petsc_matmul completed successfully", flush=True)
+                return result
+            finally:
+                print(f"[PETSc-DEBUG] Cleaning up PETSc matrices...", flush=True)
+                for mat_name, mat in [("Jt", petsc_Jt), ("GJ", petsc_GJ), ("A", petsc_A)]:
+                    try:
+                        if mat is not None:
+                            print(f"[PETSc-DEBUG] Destroying {mat_name}...", flush=True)
+                            mat.destroy()
+                            print(f"[PETSc-DEBUG] {mat_name} destroyed", flush=True)
+                    except Exception as e:
+                        print(f"[PETSc-DEBUG] Error destroying {mat_name}: {e}", flush=True)
+
+        if use_petsc_gpu:
+            if not HAVE_PETSC4PY:
+                if verbose_gpu:
+                    print('[PDE] PETSc GPU path requested but petsc4py is unavailable; falling back to CPU assembly.', flush=True)
+            else:
+                try:
+                    A_csr_petsc = _petsc_matmul(Jt_csr, GJ)
+                    if verbose_gpu:
+                        print('[PDE] PETSc MatMatMult completed successfully.', flush=True)
+                    return _finalize_csr(A_csr_petsc)
+                except Exception as pet_err:
+                    if verbose_gpu:
+                        print(f'[PDE] PETSc MatMatMult failed ({pet_err}); reverting to existing path.', flush=True)
+
+        # CPU fallback
+        A_csr = Jt_csr.dot(GJ)
+        return _finalize_csr(A_csr)
 
 
     def _get_b(self):
